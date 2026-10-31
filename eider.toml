@@ -1,0 +1,21 @@
+[package]
+name = "rpc"
+version = "0.1.0"
+eider = "0.1"
+# `import "rpc"` and `import "rpc/jsonrpc"` are the same module
+entry = "jsonrpc.ei"
+description = "JSON-RPC 2.0 over HTTP on eider-http: a dispatch table, typed methods, batches and notifications, the HTTP handler and a client (docs/jsonrpc.md)"
+
+# the HTTP types and the client calls (`call`, `notify`): sockets and deadlines. rpc's own
+# code asks for nothing more than its client calls do, but a grant is checked against what
+# the program loads of http, so it grants what http's modules use (eider-http's
+# docs/services.md, N14)
+[deps.http]
+git = "https://github.com/klxdev/eider-http.git"
+version = "0.1.0"
+uses = ["net", "io", "clock", "threads", "fs"]
+
+# request and response bodies; pure, granted nothing
+[deps.json]
+git = "https://github.com/klxdev/eider-json.git"
+version = "0.1.0"

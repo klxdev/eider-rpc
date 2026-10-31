@@ -1,5 +1,5 @@
 // kvstore end to end: the service starts on 127.0.0.1 on an ephemeral port, is called over
-// loopback with packages/http's client (JSON-RPC on one keep-alive connection, a batch, the
+// loopback with eider-http's client (JSON-RPC on one keep-alive connection, a batch, the
 // REST route, four clients at once from a task group), and is shut down through its token.
 // No fixed ports, no sleeps: the server listens before its thread starts, and each call
 // waits (with a deadline) for its own response.
@@ -14,7 +14,7 @@ import "json"
 import "http"
 import "http/server"
 import "http/client"
-import "http/jsonrpc"
+import "rpc/jsonrpc"
 import "../kv.ei"
 
 fn show(r: Result[jsonrpc.Reply, String]) uses io {

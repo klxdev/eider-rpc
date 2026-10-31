@@ -6,7 +6,7 @@
 //
 // SIGTERM or SIGINT (Ctrl-C) shuts it down gracefully: requests in flight finish, idle
 // connections close, then it prints what it served. Plain HTTP only: put it behind a
-// TLS-terminating proxy to expose it (docs/services.md "Security posture").
+// TLS-terminating proxy to expose it (eider-http's docs/services.md "Security posture").
 
 import "core/sys"
 import "std/bytes"
@@ -74,7 +74,7 @@ fn main() uses io, fs, net, clock, threads {
         0
     })
 
-    // the profiler's endpoints, only on request (a binary built with --profile; docs/runtime.md)
+    // the profiler's endpoints, only on request (a binary built with --profile; eider-lang's docs/runtime.md)
     let mut prof = profiling.options()
     match env.get(sys.lit("KVSTORE_PROFILING")) {
         Some(v) => { prof.enabled = bytes.eq(v, sys.lit("1")) }

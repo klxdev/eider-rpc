@@ -1,14 +1,23 @@
 [package]
 name = "kvstore"
 version = "0.1.0"
+eider = "0.1"
 main = "main.ei"
-description = "An example JSON-RPC 2.0 service on packages/http: a key-value store and a calculator (docs/services.md)"
+description = "An example JSON-RPC 2.0 service on eider-rpc and eider-http: a key-value store and a calculator (../../docs/jsonrpc.md)"
 
-# the server and client: sockets, deadlines, worker threads; files for the profiler's /debug/profile (http/profiling)
+# JSON-RPC: this repository's package (an example isn't published, so a path is fine)
+[deps.rpc]
+path = "../.."
+uses = ["net", "io", "clock"]
+
+# the server and client: sockets, deadlines, worker threads; files for the profiler's
+# /debug/profile (http/profiling)
 [deps.http]
-path = "../../packages/http"
+git = "https://github.com/klxdev/eider-http.git"
+version = "0.1.0"
 uses = ["net", "io", "clock", "threads", "fs"]
 
 # reading results in the end-to-end test; pure
 [deps.json]
-path = "../../packages/json"
+git = "https://github.com/klxdev/eider-json.git"
+version = "0.1.0"

@@ -1,5 +1,5 @@
-//! http/jsonrpc: JSON-RPC 2.0 (https://www.jsonrpc.org/specification) over HTTP POST, on
-//! packages/json: the first RPC milestone (decision C7).
+//! rpc/jsonrpc: JSON-RPC 2.0 (https://www.jsonrpc.org/specification) over HTTP POST, on
+//! eider-http and eider-json: the first RPC milestone (eider-lang decision C7).
 //!
 //! Server side: a `Table` maps method names to handlers. A handler gets the call's `Params`
 //! (typed accessors: `p.int(0, "a")` reads positional parameter 0 or named parameter `a`) and
@@ -32,8 +32,8 @@ import "std/bytes"
 import "std/profile"
 import "std/time"
 import "json"
-import "http.ei"
-import "client.ei"
+import "http"
+import "http/client"
 
 pub const PARSE_ERROR: i64 = -32700
 pub const INVALID_REQUEST: i64 = -32600

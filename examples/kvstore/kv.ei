@@ -1,4 +1,4 @@
-// kvstore: an example JSON-RPC 2.0 service on packages/http (docs/services.md).
+// kvstore: an example JSON-RPC 2.0 service on eider-rpc and eider-http (docs/jsonrpc.md).
 //
 // Methods (POST /rpc, `Content-Type: application/json`):
 //   kv.put(key, value)  -> the previous value, or null
@@ -17,7 +17,7 @@ import "std/bytes"
 import "std/sync"
 import "http"
 import "http/router"
-import "http/jsonrpc"
+import "rpc/jsonrpc"
 import "http/profiling"
 
 // `keys` keeps insertion order for kv.keys (iterating the Map gives its slot order)
@@ -117,7 +117,7 @@ pub fn rpc(s: Store) -> jsonrpc.Table {
 }
 
 /// The whole service: /rpc, /health and /kv/:key, each route under the profiler's `method`
-/// and `route` labels (packages/http/profiling.ei; nothing without --profile).
+/// and `route` labels (eider-http's http/profiling; nothing without --profile).
 pub fn app(s: Store) -> http.Handler {
     let mut r = routes(s)
     profiling.label_routes(inout r)
