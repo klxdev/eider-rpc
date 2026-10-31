@@ -10,7 +10,8 @@
 // Also GET /health (`ok`) and GET /kv/:key (the value as text, or 404).
 //
 // The store is shared by every worker thread through a sync.Lock: each method is one
-// critical section, so concurrent calls see a consistent store.
+// critical section (`modify`, which changes the store in place), so concurrent calls see a
+// consistent store.
 
 import "core/sys"
 import "std/bytes"
@@ -56,37 +57,32 @@ fn two_ints(p: jsonrpc.Params) -> Result[Two, jsonrpc.Error] {
 
 impl Store {
     fn put(self, k: List[u8], v: List[u8]) -> Option[List[u8]] {
-        self.st.with(|s: Kv| -> (Kv, Option[List[u8]]) {
-            let mut t = s.copy()
-            let old = t.vals.get(k)
-            if old.is_none() { t.keys.push(k) }
-            t.vals.insert(k, v)
-            (t, old)
+        self.st.modify(|inout s: Kv| -> Option[List[u8]] {
+            let old = s.vals.get(k)
+            if old.is_none() { s.keys.push(k) }
+            s.vals.insert(k, v)
+            old
         })
     }
 
     fn get(self, k: List[u8]) -> Option[List[u8]] {
-        self.st.with(|s: Kv| -> (Kv, Option[List[u8]]) {
-            let v = s.vals.get(k)
-            (s, v)
-        })
+        self.st.modify(|inout s: Kv| -> Option[List[u8]] s.vals.get(k))
     }
 
     fn delete(self, k: List[u8]) -> bool {
-        self.st.with(|s: Kv| -> (Kv, bool) {
-            let mut t = s.copy()
-            if !t.vals.contains(k) { return (t, false) }
-            t.vals.remove(k)
+        self.st.modify(|inout s: Kv| -> bool {
+            if !s.vals.contains(k) { return false }
+            s.vals.remove(k)
             let mut keep: List[List[u8]] = List.new()
-            for x in t.keys {
+            for x in s.keys {
                 if !bytes.eq(x, k) { keep.push(x) }
             }
-            t.keys = keep
-            (t, true)
+            s.keys = keep
+            true
         })
     }
 
-    fn keys(self) -> List[List[u8]] { self.st.with(|s: Kv| -> (Kv, List[List[u8]]) (s, s.keys)) }
+    fn keys(self) -> List[List[u8]] { self.st.modify(|inout s: Kv| -> List[List[u8]] s.keys) }
 }
 
 /// The JSON-RPC methods over `s`.
