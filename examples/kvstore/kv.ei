@@ -13,13 +13,13 @@
 // critical section (`modify`, which changes the store in place), so concurrent calls see a
 // consistent store.
 
-import "core/sys"
-import "std/bytes"
-import "std/sync"
-import "http"
-import "http/router"
-import "rpc/jsonrpc"
-import "http/profiling"
+import core.sys
+import std.bytes
+import std.sync
+import http
+import http.router
+import rpc.jsonrpc
+import http.profiling
 
 // `keys` keeps insertion order for kv.keys (iterating the Map gives its slot order)
 type Kv = { keys: List[List[u8]], vals: Map[List[u8], List[u8]] }

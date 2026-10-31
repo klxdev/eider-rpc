@@ -2,12 +2,12 @@
 // Table, typed methods (decoders, encoders, -32602 from a bad parameter), errors with data,
 // the HTTP handler's method and media-type checks, and the client's reply parsing.
 
-import "core/sys"
-import "std/bytes"
-import "std/io"
-import "json"
-import "http"
-import "../jsonrpc.ei"
+import core.sys
+import std.bytes
+import std.io
+import json
+import http
+import rpc.jsonrpc
 
 type Pair = { a: i64, b: i64 }
 

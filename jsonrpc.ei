@@ -27,13 +27,13 @@
 //! Client side: `call` sends one request on a client.Conn and returns the result or the
 //! error; `notify` sends a notification.
 
-import "core/sys"
-import "std/bytes"
-import "std/profile"
-import "std/time"
-import "json"
-import "http"
-import "http/client"
+import core.sys
+import std.bytes
+import std.profile
+import std.time
+import json
+import http
+import http.client
 
 pub const PARSE_ERROR: i64 = -32700
 pub const INVALID_REQUEST: i64 = -32600

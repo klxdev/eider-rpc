@@ -8,7 +8,7 @@ batches and notifications as the specification says, the HTTP handler and a clie
 Typed services generated from Eider types are the next step (eider-lang's roadmap P1.1).
 
 ```eider,ignore
-import "rpc/jsonrpc"
+import rpc.jsonrpc
 
 let mut t = jsonrpc.table()
 t.add("math.add", |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
@@ -37,7 +37,7 @@ version = "0.1.0"
 uses = ["net", "io", "clock", "threads"]      # the server
 ```
 
-then `eider-pkg fetch` (eider-lang's `scripts/eider-pkg`) and `import "rpc/jsonrpc"`.
+then `eider-pkg fetch` (eider-lang's `scripts/eider-pkg`) and `import rpc.jsonrpc`.
 
 ## Developing
 

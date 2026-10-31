@@ -1,6 +1,6 @@
 # JSON-RPC 2.0 (rpc/jsonrpc)
 
-`rpc/jsonrpc` (also `import "rpc"`) is JSON-RPC 2.0 over HTTP `POST`, on eider-http's
+`rpc/jsonrpc` (also `import rpc`) is JSON-RPC 2.0 over HTTP `POST`, on eider-http's
 server, router and client and eider-json. It is the first milestone of Eider's RPC work
 (eider-lang's docs/design/roadmap.md P1.1; decisions C7 and C47 in eider-lang's
 docs/decisions.md). Until eider-lang U19 it was `http/jsonrpc` in eider-lang's
@@ -8,11 +8,11 @@ packages/http; this is that module with its history, and the JSON-RPC parts of w
 eider-http's docs/services.md.
 
 ```eider,ignore
-import "std/net"
-import "std/task"
-import "http/server"
-import "http/router"
-import "rpc/jsonrpc"
+import std.net
+import std.task
+import http.server
+import http.router
+import rpc.jsonrpc
 
 fn main() uses io, net, clock, threads {
     let mut rpc = jsonrpc.table()

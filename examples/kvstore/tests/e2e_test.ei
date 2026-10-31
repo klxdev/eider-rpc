@@ -4,18 +4,18 @@
 // No fixed ports, no sleeps: the server listens before its thread starts, and each call
 // waits (with a deadline) for its own response.
 
-import "core/sys"
-import "std/bytes"
-import "std/io"
-import "std/net"
-import "std/task"
-import "std/time"
-import "json"
-import "http"
-import "http/server"
-import "http/client"
-import "rpc/jsonrpc"
-import "../kv.ei"
+import core.sys
+import std.bytes
+import std.io
+import std.net
+import std.task
+import std.time
+import json
+import http
+import http.server
+import http.client
+import rpc.jsonrpc
+import kvstore.kv
 
 fn show(r: Result[jsonrpc.Reply, String]) uses io {
     match r {

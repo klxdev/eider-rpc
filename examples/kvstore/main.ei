@@ -8,18 +8,18 @@
 // connections close, then it prints what it served. Plain HTTP only: put it behind a
 // TLS-terminating proxy to expose it (eider-http's docs/services.md "Security posture").
 
-import "core/sys"
-import "std/bytes"
-import "std/env"
-import "std/fd"
-import "std/io"
-import "std/net"
-import "std/signal"
-import "std/task"
-import "std/time"
-import "http/server"
-import "http/profiling"
-import "kv.ei"
+import core.sys
+import std.bytes
+import std.env
+import std.fd
+import std.io
+import std.net
+import std.signal
+import std.task
+import std.time
+import http.server
+import http.profiling
+import kvstore.kv
 
 fn port_arg() -> i32 uses io {
     let a = env.args()

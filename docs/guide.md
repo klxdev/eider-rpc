@@ -75,10 +75,10 @@ lock. `std/sync`'s `Lock[T]` is shared by every copy, and `with(f)` runs `f(stat
 
 ```eider,ignore
 // notes.ei
-import "std/sync"
-import "http"
-import "http/router"
-import "rpc/jsonrpc"
+import std.sync
+import http
+import http.router
+import rpc.jsonrpc
 
 /// The state, shared by every worker thread: copies of a Lock are the same lock.
 pub type Store = { st: sync.Lock[List[List[u8]]] }
@@ -173,10 +173,10 @@ answers `204` for a request with only notifications. Route patterns take paramet
 
 ```eider,ignore
 // main.ei
-import "std/net"
-import "std/task"
-import "http/server"
-import "notes.ei"
+import std.net
+import std.task
+import http.server
+import notes
 
 fn main() uses io, net, clock, threads {
     let srv = match server.listen(net.ipv4(127, 0, 0, 1, 8080), server.config()) {
@@ -260,14 +260,14 @@ runs:
 
 ```eider,ignore
 // tests/e2e_test.ei (needs `eider-pkg add json --path ...` too)
-import "std/net"
-import "std/task"
-import "std/time"
-import "json"
-import "http/server"
-import "http/client"
-import "rpc/jsonrpc"
-import "../notes.ei"
+import std.net
+import std.task
+import std.time
+import json
+import http.server
+import http.client
+import rpc.jsonrpc
+import notes
 
 fn show(r: Result[jsonrpc.Reply, String]) uses io {
     match r {

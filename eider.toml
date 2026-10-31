@@ -1,8 +1,8 @@
 [package]
 name = "rpc"
-version = "0.1.0"
+version = "0.1.1"
 eider = "0.1"
-# `import "rpc"` and `import "rpc/jsonrpc"` are the same module
+# `import rpc` and `import rpc.jsonrpc` are the same module
 entry = "jsonrpc.ei"
 description = "JSON-RPC 2.0 over HTTP on eider-http: a dispatch table, typed methods, batches and notifications, the HTTP handler and a client (docs/jsonrpc.md)"
 
