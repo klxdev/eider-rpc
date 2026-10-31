@@ -17,3 +17,5 @@ The first release, for Eider 0.1: eider-lang's `http/jsonrpc` (packages/http) an
 - `VERSION`, `eider = "0.1"`, `scripts/build.sh` and `scripts/test.sh` against an eider-lang
   checkout (`EIDER_ROOT`), refusing a toolchain of another MAJOR.MINOR, with
   `EIDER_PKG_OVERRIDE` set for sibling checkouts (scripts/env.sh).
+- `scripts/version.sh` (`check`, `sync`): eider.toml agrees with VERSION; eider-lang's
+  `scripts/version.sh check-siblings` and `bump` drive it.
