@@ -3,6 +3,13 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- examples/kvstore uses eider-json's derived codecs (eider-json 0.2.1): `math.add` and
+  `math.div` decode named parameters with a derived decoder (a member other than `a` and `b`
+  is "Invalid params", with its path in the data), and the new `kv.stats` writes its result
+  with a derived encoder.
+
 ## 0.2.0
 
 For Eider 0.2 (`eider = "0.2"`): eider-lang's 0.2 builds programs only through LLVM (clang

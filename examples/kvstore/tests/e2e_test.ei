@@ -25,6 +25,10 @@ fn show(r: Result[jsonrpc.Reply, String]) uses io {
             bytes.append(inout l, bytes.from_i64(e.code))
             l.push(32)
             bytes.append(inout l, e.message)
+            if e.data.len() > 0 {
+                l.push(32)
+                bytes.append(inout l, e.data)
+            }
             io.outln(l)
         }
         Err(e) => print(e)
@@ -56,6 +60,10 @@ fn main() uses io, net, clock, threads {
     show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("[40, 2]"), 9, dl))
     show(jsonrpc.call(inout c, "/rpc", "math.div", sys.lit("{\"a\": 7, \"b\": 0}"), 10, dl))
     show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("[9223372036854775807, 1]"), 11, dl))
+    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("{\"a\": 40, \"b\": 2}"), 31, dl))
+    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("{\"a\": 40, \"b\": 2, \"c\": 1}"), 32, dl))
+    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("{\"a\": 40, \"b\": \"2\"}"), 33, dl))
+    show(jsonrpc.call(inout c, "/rpc", "kv.stats", List.new(), 34, dl))
     show(jsonrpc.call(inout c, "/rpc", "kv.get", sys.lit("[1]"), 12, dl))
     show(jsonrpc.call(inout c, "/rpc", "no.such", List.new(), 13, dl))
     print(jsonrpc.notify(inout c, "/rpc", "kv.put", sys.lit("[\"quiet\", \"yes\"]"), dl).unwrap())

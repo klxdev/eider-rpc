@@ -6,7 +6,11 @@
 //   kv.delete(key)      -> true if the key was there
 //   kv.keys()           -> every key, in insertion order
 //   math.add(a, b), math.div(a, b) -> an integer; division by zero is error -32000
-// Parameters are positional (`[k, v]`) or named (`{"key": k, "value": v}`).
+//   kv.stats()          -> {"keys": n, "valueBytes": n}
+// Parameters are positional (`[k, v]`) or named (`{"key": k, "value": v}`). The math methods'
+// named parameters and kv.stats's result go through eider-json's derived codecs (`Two`,
+// `Stats`): decoding is strict (a member other than `a` and `b` is invalid params, with the
+// member's path in the error data).
 // Also GET /health (`ok`) and GET /kv/:key (the value as text, or 404).
 //
 // The store is shared by every worker thread through a sync.Lock: each method is one
@@ -16,6 +20,7 @@
 import core.sys
 import std.bytes
 import std.sync
+import json
 import http
 import http.router
 import rpc.jsonrpc
@@ -50,9 +55,30 @@ fn key_arg(p: jsonrpc.Params) -> Result[List[u8], jsonrpc.Error] {
 
 type Two = { a: i64, b: i64 }
 
+impl json.Decode for Two {
+    fn decode(inout r: json.Reader) -> Result[Two, json.DecodeError] { json.decode_record(inout r) }
+    fn missing() -> Option[Two] { None }
+}
+
 fn two_ints(p: jsonrpc.Params) -> Result[Two, jsonrpc.Error] {
+    if p.named() {
+        // `{"a": 1, "b": 2}`: the derived decoder (eider-json), which rejects other members
+        let mut r = json.reader(p.doc, p.node)
+        return match Two.decode(inout r) {
+            Ok(t) => Ok(t)
+            Err(e) => Err(jsonrpc.invalid_params(json.decode_error_text(e)))
+        }
+    }
     p.at_most(2)?
     Ok(Two(p.int(0, "a")?, p.int(1, "b")?))
+}
+
+/// kv.stats's result, written by the derived encoder.
+@json(rename_all = "camelCase")
+type Stats = { keys: u64, value_bytes: u64 }
+
+impl json.Encode for Stats {
+    fn encode(self, inout w: json.Writer) { json.encode_record(self, inout w) }
 }
 
 impl Store {
@@ -83,6 +109,19 @@ impl Store {
     }
 
     fn keys(self) -> List[List[u8]] { self.st.modify(|inout s: Kv| -> List[List[u8]] s.keys) }
+
+    fn stats(self) -> Stats {
+        self.st.modify(|inout s: Kv| -> Stats {
+            let mut n: u64 = 0
+            for k in s.keys {
+                match s.vals.get(k) {
+                    Some(v) => { n += v.len() as u64 }
+                    None => {}
+                }
+            }
+            Stats(s.keys.len() as u64, n)
+        })
+    }
 }
 
 /// The JSON-RPC methods over `s`.
@@ -96,6 +135,10 @@ pub fn rpc(s: Store) -> jsonrpc.Table {
         let mut items: List[List[u8]] = List.new()
         for k in s.keys() { items.push(jsonrpc.string(k)) }
         Ok(jsonrpc.array(items))
+    })
+    t.add("kv.stats", |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
+        p.none()?
+        Ok(json.to_json(s.stats()))
     })
     t.add_typed("math.add", two_ints, jsonrpc.int, |x: Two| -> Result[i64, jsonrpc.Error] {
         // checked: an overflow is an error for the caller, not a trap in the server
