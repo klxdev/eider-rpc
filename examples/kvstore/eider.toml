@@ -1,7 +1,7 @@
 [package]
 name = "kvstore"
 version = "0.1.0"
-eider = "0.2"
+eider = "0.3"
 main = "main.ei"
 description = "An example JSON-RPC 2.0 service on eider-rpc and eider-http: a key-value store and a calculator (../../docs/jsonrpc.md)"
 
@@ -14,10 +14,10 @@ uses = ["net", "io", "clock"]
 # /debug/profile (http/profiling)
 [deps.http]
 git = "https://github.com/klxdev/eider-http.git"
-version = "0.1.0"
+version = "0.3.0"
 uses = ["net", "io", "clock", "threads", "fs"]
 
 # reading results in the end-to-end test; pure
 [deps.json]
 git = "https://github.com/klxdev/eider-json.git"
-version = "0.1.0"
+version = "0.3.0"
