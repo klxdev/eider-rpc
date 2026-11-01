@@ -1,6 +1,6 @@
 [package]
 name = "rpc"
-version = "0.1.1"
+version = "0.1.2"
 eider = "0.1"
 # `import rpc` and `import rpc.jsonrpc` are the same module
 entry = "jsonrpc.ei"
