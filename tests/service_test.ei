@@ -1,0 +1,139 @@
+// rpc/service: a service as a trait (Billing), registered with typed methods (no decoders or
+// encoders by hand), called positionally, by name and badly through the table, then over
+// loopback through a client that implements the same trait.
+
+import core.sys
+import std.bytes
+import std.io
+import std.net
+import std.sync
+import std.task
+import json
+import http
+import http.server
+import rpc.jsonrpc
+import rpc.service
+
+@json(rename_all = "camelCase")
+type Charge = { account: String, amount_cents: u32, memo: Option[String] }
+
+type Refund = { receipt: i64 }
+
+@json(tag = "state")
+type Status =
+    | Paid(receipt: i64)
+    | Refunded(receipt: i64, reason: String)
+    | Unknown
+
+type Receipt = { id: i64, account: String, status: Status }
+
+trait Billing {
+    fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error]
+    fn refund(self, req: Refund) -> Result[Receipt, jsonrpc.Error]
+    fn count(self) -> Result[i64, jsonrpc.Error]
+}
+
+type Ledger = { n: sync.Lock[i64] }
+
+impl Billing for Ledger {
+    fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error] {
+        if req.amount_cents == 0 { return Err(jsonrpc.error(-32001, "nothing to charge")) }
+        let id = self.n.modify(|inout n: i64| -> i64 {
+            n += 1
+            n
+        })
+        Ok(Receipt(id, req.account, Paid(id)))
+    }
+
+    fn refund(self, req: Refund) -> Result[Receipt, jsonrpc.Error] {
+        Ok(Receipt(req.receipt, String.from("?"), Refunded(req.receipt, String.from("requested"))))
+    }
+
+    fn count(self) -> Result[i64, jsonrpc.Error] { Ok(self.n.modify(|inout n: i64| -> i64 n)) }
+}
+
+// one line a method; the rest (parameters, results, errors) is derived
+impl service.Service for Ledger {
+    fn register(self, inout r: service.Registry) {
+        r.add_json("charge", |q: Charge| self.charge(q))
+        r.add_json("refund", |q: Refund| self.refund(q))
+        r.add_none("count", || self.count())
+    }
+}
+
+// the client implements the same trait: code written against Billing runs here or there
+type BillingClient = { remote: service.Remote }
+
+impl Billing for BillingClient {
+    fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error] uses net, io, clock { self.remote.call("billing.charge", req) }
+    fn refund(self, req: Refund) -> Result[Receipt, jsonrpc.Error] uses net, io, clock { self.remote.call("billing.refund", req) }
+    fn count(self) -> Result[i64, jsonrpc.Error] uses net, io, clock { self.remote.call_none("billing.count") }
+}
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn ask(t: jsonrpc.Table, body: str) uses io {
+    match t.handle(lit(body)) {
+        Some(r) => io.outln(r)
+        None => print("(no response)")
+    }
+}
+
+fn show[R: json.Encode](label: str, r: Result[R, jsonrpc.Error]) uses io {
+    match r {
+        Ok(v) => io.outln(bytes.concat(lit(label), bytes.concat(lit(" = "), json.to_json(v))))
+        Err(e) => {
+            let mut m = lit(label)
+            bytes.append(inout m, lit(" failed "))
+            bytes.append(inout m, bytes.from_i64(e.code))
+            m.push(32)
+            bytes.append(inout m, e.message)
+            if e.data.len() > 0 {
+                m.push(32)
+                bytes.append(inout m, e.data)
+            }
+            io.outln(m)
+        }
+    }
+}
+
+fn main() uses io, net, clock, threads {
+    let ledger = Ledger(sync.lock(0))
+    let mut t = jsonrpc.table()
+    service.mount(inout t, "billing", ledger)
+    print("-- named, positional, absent parameters")
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":{"account":"acme","amountCents":1250,"memo":"hosting"},"id":1}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":["acme",300],"id":2}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.refund","params":[1],"id":3}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.count","id":4}"#)
+    print("-- errors")
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":{"account":"acme","amountCents":0},"id":5}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":{"account":"acme","amountCents":-4},"id":6}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":{"amountCents":4},"id":7}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":["a",1,"memo","extra"],"id":8}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.charge","params":{"account":"acme","amountCents":1,"bogus":true},"id":9}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.count","params":[1],"id":10}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.nope","id":11}"#)
+    ask(t, r#"{"jsonrpc":"2.0","method":"billing.refund","params":[2]}"#)
+    print("-- over loopback, through the client that implements Billing")
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), server.config()).unwrap()
+    let addr = srv.addr()
+    let tok = task.root()
+    let stop = tok
+    let h = jsonrpc.handler(t)
+    let running = spawn(|| -> server.Stats { srv.serve(h, stop).unwrap() })
+    let remote = BillingClient(service.remote(addr, "/rpc"))
+    show("charge", remote.charge(Charge(String.from("globex"), 99, Some(String.from("late fee")))))
+    show("charge", remote.charge(Charge(String.from("globex"), 0, None)))
+    show("refund", remote.refund(Refund(7)))
+    show("count", remote.count())
+    show("local count", ledger.count())
+    let dead = BillingClient(service.remote(net.ipv4(127, 0, 0, 1, 1), "/rpc").with_timeout_ms(500))
+    match dead.count() {
+        Ok(n) => print("?")
+        Err(e) => print(e.code)
+    }
+    tok.cancel()
+    let stats = running.join()
+    print(stats.requests)
+}

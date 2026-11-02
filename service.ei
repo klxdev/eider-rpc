@@ -1,0 +1,212 @@
+//! rpc/service: typed services over JSON-RPC with no hand-written decoders or encoders. A
+//! method is a function from a parameter type `P` to `Result[R, Error]`; `P` and `R` are
+//! records, enums, lists... that have eider-json's derived codecs (`Decode`, `Encode`,
+//! `@json(...)` attributes apply), so the parameters are checked and converted by the same
+//! reflection that converts every other JSON value, and a bad parameter is `-32602 Invalid
+//! params` with the path of the offending member (`$.amount: not a u32 ...`).
+//!
+//! A service is a trait of your own, and the same trait describes both ends:
+//!
+//!     trait Billing {
+//!         fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error]
+//!         fn refund(self, req: Refund) -> Result[Receipt, jsonrpc.Error]
+//!     }
+//!
+//!     impl Billing for Ledger { ... }                     // the server's implementation
+//!     impl service.Service for Ledger {                   // its registration, one line a method
+//!         fn register(self, inout r: service.Registry) {
+//!             r.add_json("charge", |q: Charge| self.charge(q))
+//!             r.add_json("refund", |q: Refund| self.refund(q))
+//!         }
+//!     }
+//!     impl Billing for BillingClient { ... }              // a stub: `self.remote.call("billing.charge", req)`
+//!
+//!     service.mount(inout table, "billing", ledger)       // methods billing.charge, billing.refund
+//!
+//! The registration and the stub are written by hand: eider 0.4.0's reflection covers the fields
+//! and variants of a type, not the methods of a trait or the parameters of a function, so a
+//! library can't enumerate `Billing` (eider-lang#154, "Function and trait reflection"). Everything else is derived: parameter and result conversion on both
+//! sides, positional parameters mapped onto a record's fields, the method name prefix, error
+//! mapping. When the language can enumerate a trait's methods, `register` and the stub are the
+//! only things that become generated.
+//!
+//! Parameters: `add_json` takes a record `P`: the call's `params` as an object are `P`'s
+//! members, as an array they are `P`'s fields in order (skipped fields don't count), absent
+//! they are `{}` (fine when every field is an Option or `@json(default)`). `add_value` takes any
+//! `P` and decodes the `params` array or object itself (a `List[i64]`, an enum), and `add_none`
+//! a method without parameters.
+
+import core.sys
+import std.bytes
+import std.net
+import std.time
+import json
+import http
+import http.client
+import rpc.jsonrpc
+
+/// -32000: the call did not get an answer (no connection, deadline, HTTP error).
+pub const TRANSPORT_ERROR: i64 = -32000
+
+/// Methods are added under a prefix (`billing.`).
+pub type Registry = { t: jsonrpc.Table, prefix: List[u8] }
+
+/// A service's registration (see the module comment).
+pub trait Service {
+    fn register(self, inout r: Registry)
+}
+
+/// Mounts `svc` on `t`: every method it registers is named `<prefix>.<name>`.
+pub fn mount[S: Service](inout t: jsonrpc.Table, prefix: str, svc: S) {
+    let mut p = sys.lit(prefix)
+    if p.len() > 0 { p.push(46) }
+    let mut r = Registry(t.copy(), p)
+    svc.register(inout r)
+    t = r.t
+}
+
+fn decode_failed(e: json.DecodeError) -> jsonrpc.Error {
+    jsonrpc.invalid_params(json.decode_error_text(e))
+}
+
+/// The member names of record type P, in field order, skipped fields left out. `proto` only
+/// names the type.
+fn member_names[P](proto: Option[P]) -> List[List[u8]] {
+    let mut out: List[List[u8]] = List.new()
+    comptime for f in fields(P) {
+        comptime if !attr[json.json](f).skip {
+            out.push(json.member_name(f.name, attr[json.json](f).name, attr[json.json](P).rename_all))
+        }
+    }
+    out
+}
+
+/// The call's parameters as a `P` (a record): an object is P's members, an array is its fields
+/// in order, no parameters are `{}`.
+pub fn params_as[P: json.Decode](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] {
+    let mut d = p.doc.copy()
+    let mut node = p.node.copy()
+    if !p.present {
+        node = json.new_object(inout d, List.new(), List.new())
+    } else if !p.named() {
+        let none: Option[P] = None
+        let names = member_names(none)
+        if (json.len(d, node) as usize) > names.len() { return Err(jsonrpc.invalid_params(sys.lit("too many parameters"))) }
+        let mut keys: List[List[u8]] = List.new()
+        let mut vals: List[u32] = List.new()
+        for i in 0..json.len(d, node) {
+            keys.push(names[i as usize].copy())
+            vals.push(json.at(d, node, i).unwrap())
+        }
+        node = json.new_object(inout d, keys, vals)
+    }
+    let mut r = json.reader(d, node)
+    match P.decode(inout r) {
+        Ok(x) => Ok(x)
+        Err(e) => Err(decode_failed(e))
+    }
+}
+
+/// The `params` node itself as a `P` (an array or object, whatever P decodes from).
+pub fn value_as[P: json.Decode](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] {
+    if !p.present { return Err(jsonrpc.invalid_params(sys.lit("parameters are required"))) }
+    let mut r = json.reader(p.doc, p.node)
+    match P.decode(inout r) {
+        Ok(x) => Ok(x)
+        Err(e) => Err(decode_failed(e))
+    }
+}
+
+impl Registry {
+    fn full(self, name: str) -> List[u8] { bytes.concat(self.prefix, sys.lit(name)) }
+
+    /// A method whose parameters are the members (or, positionally, the fields) of record P.
+    fn add_json[P: json.Decode, R: json.Encode](inout self, name: str, f: fn(P) -> Result[R, jsonrpc.Error]) {
+        let full = self.full(name)
+        self.t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
+            let got: Result[P, jsonrpc.Error] = params_as(p)
+            let args = got?
+            let r = f(args)?
+            Ok(json.to_json(r))
+        })
+    }
+
+    /// A method whose parameters are the array or object that P decodes from.
+    fn add_value[P: json.Decode, R: json.Encode](inout self, name: str, f: fn(P) -> Result[R, jsonrpc.Error]) {
+        let full = self.full(name)
+        self.t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
+            let got: Result[P, jsonrpc.Error] = value_as(p)
+            let args = got?
+            let r = f(args)?
+            Ok(json.to_json(r))
+        })
+    }
+
+    /// A method without parameters.
+    fn add_none[R: json.Encode](inout self, name: str, f: fn() -> Result[R, jsonrpc.Error]) {
+        let full = self.full(name)
+        self.t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
+            p.none()?
+            let r = f()?
+            Ok(json.to_json(r))
+        })
+    }
+}
+
+// ---- client
+
+/// A service at `target` (`/rpc`) of the server at `addr`: each call is one request on a
+/// connection of its own, so a `Remote` is a plain value that any number of threads may call.
+pub type Remote = { addr: net.Addr, target: List[u8], timeout_ms: i64 }
+
+pub fn remote(addr: net.Addr, target: str) -> Remote { Remote(addr, sys.lit(target), 5000) }
+
+fn transport(msg: String) -> jsonrpc.Error {
+    jsonrpc.error_data(TRANSPORT_ERROR, sys.lit("Transport error"), json.quote(msg.bytes()))
+}
+
+impl Remote {
+    fn with_timeout_ms(self, ms: i64) -> Remote { Remote(self.addr, self.target.copy(), ms) }
+
+    /// Calls `method` with `params` encoded as JSON (a record: named parameters), and decodes
+    /// the result as an `R`. A server's error comes back as it is; a failure to reach it is
+    /// `TRANSPORT_ERROR`, a result that isn't an `R` is `INTERNAL_ERROR`.
+    fn call[P: json.Encode, R: json.Decode](self, method: str, params: P) -> Result[R, jsonrpc.Error] uses net, io, clock {
+        self.send(method, json.to_json(params))
+    }
+
+    /// `call` for a method without parameters.
+    fn call_none[R: json.Decode](self, method: str) -> Result[R, jsonrpc.Error] uses net, io, clock {
+        self.send(method, List.new())
+    }
+
+    fn send[R: json.Decode](self, method: str, params: List[u8]) -> Result[R, jsonrpc.Error] uses net, io, clock {
+        let dl = time.after_ms(self.timeout_ms)
+        let mut req = http.request("POST", self.target.copy())
+        req.set_header("Content-Type", sys.lit("application/json"))
+        req.body = jsonrpc.request_body(sys.lit(method), params, Some(1))
+        let resp = match client.fetch(self.addr, req, dl) {
+            Ok(r) => r
+            Err(m) => { return Err(transport(m)) }
+        }
+        if resp.status != 200 {
+            let mut m = String.from("HTTP status ")
+            m.append(String.from_int(resp.status as i64))
+            return Err(transport(m))
+        }
+        let reply = match jsonrpc.parse_reply(resp.body, 1) {
+            Ok(x) => x
+            Err(m) => { return Err(transport(m)) }
+        }
+        match reply {
+            jsonrpc.Fault(e) => Err(e)
+            jsonrpc.Value(d, node) => {
+                let mut rd = json.reader(d, node)
+                match R.decode(inout rd) {
+                    Ok(v) => Ok(v)
+                    Err(e) => Err(jsonrpc.error_data(jsonrpc.INTERNAL_ERROR, sys.lit("Invalid result"), json.quote(json.decode_error_text(e))))
+                }
+            }
+        }
+    }
+}

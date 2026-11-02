@@ -3,6 +3,15 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- rpc/service (eider-rpc#1, partly): typed methods over eider-json's derived codecs
+  (`Registry.add_json`, `add_value`, `add_none`; named or positional parameters mapped onto a
+  record), services as traits with `Service`/`mount`, and `Remote`, a client that can implement
+  the same trait. The per-method registration and stub are hand-written until trait
+  reflection exists (eider-lang#154); Connect is not done.
+- `Table.add_bytes`.
+
 ## 0.4.0
 
 For Eider 0.4 (`eider = "0.4"`). Requires eider-http and eider-json 0.4.0. Nothing else changed.

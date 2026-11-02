@@ -5,7 +5,9 @@ RPC services for [Eider](https://github.com/klxdev/eider-lang), on
 [eider-json](https://github.com/klxdev/eider-json). Today that is JSON-RPC 2.0 over HTTP
 `POST` (`rpc/jsonrpc`): a dispatch table, typed methods (decoder, function, encoder),
 batches and notifications as the specification says, the HTTP handler and a client.
-Typed services generated from Eider types are the next step (eider-lang's roadmap P1.1).
+`rpc/service` makes a service a trait of your own: methods are plain typed functions whose
+parameters and results go through eider-json's derived codecs, with a one-line registration and
+client stub per method (generating those waits for trait reflection, eider-lang#154).
 
 ```eider,ignore
 import rpc.jsonrpc

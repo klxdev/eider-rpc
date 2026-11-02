@@ -83,3 +83,47 @@ Typed services (P1.1): with JSON derive (P0.10) and `dyn Trait` (P0.7), a servic
 trait whose methods become `add_typed` entries and a client stub, generated from the types
 instead of written by hand; then Connect (HTTP + JSON) as a second wire format, and OpenRPC
 descriptions of the methods.
+
+## Services as traits (`rpc/service`)
+
+A service is a trait of your own; its server and client are the same trait implemented twice:
+
+```eider
+trait Billing {
+    fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error]
+    fn count(self) -> Result[i64, jsonrpc.Error]
+}
+
+impl service.Service for Ledger {                       // the registration: one line a method
+    fn register(self, inout r: service.Registry) {
+        r.add_json("charge", |q: Charge| self.charge(q))
+        r.add_none("count", || self.count())
+    }
+}
+service.mount(inout table, "billing", ledger)            // billing.charge, billing.count
+
+impl Billing for BillingClient {                         // the stub: one line a method
+    fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error] uses net, io, clock { self.remote.call("billing.charge", req) }
+    ...
+}
+```
+
+No decoder, encoder or schema is written: parameters and results go through eider-json's
+derived codecs (`@json(...)` applies). `add_json` takes a record `P`: a call's `params` object
+is its members, an `params` array is its fields in order (skipped fields don't count), absent
+`params` are `{}`; a parameter that doesn't fit is `-32602` with the JSONPath of the member
+(`$.amountCents: not a u32 ...`), a surplus positional parameter or an unknown member is an
+error too. `add_value` decodes any `P` from the `params` array or object itself and `add_none`
+is a method without parameters. `service.Remote` (`remote(addr, "/rpc")`, `call`, `call_none`)
+makes one request per call on its own connection, so it is a plain value usable from many
+threads; a server's error comes back as it was, an unreachable server is `-32000`, a result
+that isn't an `R` is `-32603`. Because the client implements the trait too, code written
+against `Billing` runs against a local `Ledger` or a remote one. tests/service_test.ei does
+both.
+
+**What is still by hand, and why.** The registration and the stub are written per method
+because eider 0.4.0's reflection goes over the fields and variants of a type, not the methods
+of a trait: a library cannot enumerate `Billing`. That is filed as eider-lang#154
+("Function and trait reflection"); when it exists, `register` and the stub are generated from
+the trait and nothing else here changes. **Connect** (HTTP + JSON, the second wire format
+of eider-rpc#1) is not implemented.

@@ -1,0 +1,22 @@
+-- named, positional, absent parameters
+{"jsonrpc":"2.0","result":{"id":1,"account":"acme","status":{"state":"Paid","receipt":1}},"id":1}
+{"jsonrpc":"2.0","result":{"id":2,"account":"acme","status":{"state":"Paid","receipt":2}},"id":2}
+{"jsonrpc":"2.0","result":{"id":1,"account":"?","status":{"state":"Refunded","receipt":1,"reason":"requested"}},"id":3}
+{"jsonrpc":"2.0","result":2,"id":4}
+-- errors
+{"jsonrpc":"2.0","error":{"code":-32001,"message":"nothing to charge"},"id":5}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"$.amountCents: not a u32 (out of range, or not an integer)"},"id":6}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"$: missing member \"account\""},"id":7}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"too many parameters"},"id":8}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"$: unknown member \"bogus\""},"id":9}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"this method takes no parameters"},"id":10}
+{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":11}
+(no response)
+-- over loopback, through the client that implements Billing
+charge = {"id":3,"account":"globex","status":{"state":"Paid","receipt":3}}
+charge failed -32001 nothing to charge
+refund = {"id":7,"account":"?","status":{"state":"Refunded","receipt":7,"reason":"requested"}}
+count = 3
+local count = 3
+-32000
+4

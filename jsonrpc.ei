@@ -187,6 +187,13 @@ impl Table {
         self.methods.push(m)
     }
 
+    /// `add` with the name as bytes (rpc/service builds `billing.charge` from a prefix).
+    fn add_bytes(inout self, name: List[u8], m: Method) {
+        if self.names.contains(name) { panic("jsonrpc: a method is added twice") }
+        self.names.insert(name, self.methods.len())
+        self.methods.push(m)
+    }
+
     /// `add(name, typed(decode, encode, f))`.
     fn add_typed[P, R](inout self, name: str, decode: fn(Params) -> Result[P, Error], encode: fn(R) -> List[u8], f: fn(P) -> Result[R, Error]) {
         self.add(name, typed(decode, encode, f))
