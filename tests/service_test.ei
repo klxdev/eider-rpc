@@ -6,6 +6,7 @@ import core.sys
 import std.bytes
 import std.io
 import std.net
+import std.serial
 import std.sync
 import std.task
 import json
@@ -14,17 +15,19 @@ import http.server
 import rpc.jsonrpc
 import rpc.service
 
-@[json(rename_all = "camelCase")]
+@[derive(Serialize, Deserialize), serial(rename_all = "camelCase")]
 type Charge = { account: String, amount_cents: u32, memo: Option[String] }
 
+@[derive(Serialize, Deserialize)]
 type Refund = { receipt: i64 }
 
-@[json(tag = "state")]
+@[derive(Serialize, Deserialize), serial(tag = "state")]
 type Status =
     | Paid(receipt: i64)
     | Refunded(receipt: i64, reason: String)
     | Unknown
 
+@[derive(Serialize, Deserialize)]
 type Receipt = { id: i64, account: String, status: Status }
 
 trait Billing {
@@ -79,9 +82,9 @@ fn ask(t: jsonrpc.Table, body: str) uses io {
     }
 }
 
-fn show[R: json.Encode](label: str, r: Result[R, jsonrpc.Error]) uses io {
+fn show[R: serial.Serialize](label: str, r: Result[R, jsonrpc.Error]) uses io {
     match r {
-        Ok(v) => io.outln(bytes.concat(lit(label), bytes.concat(lit(" = "), json.to_json(v))))
+        Ok(v) => io.outln(bytes.concat(lit(label), bytes.concat(lit(" = "), json.to_bytes(v).unwrap_or(List.new()))))
         Err(e) => {
             let mut m = lit(label)
             bytes.append(inout m, lit(" failed "))

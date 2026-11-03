@@ -19,6 +19,7 @@
 
 import core.sys
 import std.bytes
+import std.serial
 import std.sync
 import json
 import http
@@ -53,20 +54,16 @@ fn key_arg(p: jsonrpc.Params) -> Result[List[u8], jsonrpc.Error] {
     p.str(0, "key")
 }
 
+@[derive(Deserialize)]
 type Two = { a: i64, b: i64 }
 
-impl json.Decode for Two {
-    fn decode(inout r: json.Reader) -> Result[Two, json.DecodeError] { json.decode_record(inout r) }
-    fn missing() -> Option[Two] { None }
-}
 
 fn two_ints(p: jsonrpc.Params) -> Result[Two, jsonrpc.Error] {
     if p.named() {
         // `{"a": 1, "b": 2}`: the derived decoder (eider-json), which rejects other members
-        let mut r = json.reader(p.doc, p.node)
-        return match Two.decode(inout r) {
+        return match Two.deserialize(json.deserializer(p.doc, p.node)) {
             Ok(t) => Ok(t)
-            Err(e) => Err(jsonrpc.invalid_params(json.decode_error_text(e)))
+            Err(e) => Err(jsonrpc.invalid_params(serial.error_text(e)))
         }
     }
     p.at_most(2)?
@@ -74,12 +71,8 @@ fn two_ints(p: jsonrpc.Params) -> Result[Two, jsonrpc.Error] {
 }
 
 /// kv.stats's result, written by the derived encoder.
-@[json(rename_all = "camelCase")]
+@[derive(Serialize), serial(rename_all = "camelCase")]
 type Stats = { keys: u64, value_bytes: u64 }
-
-impl json.Encode for Stats {
-    fn encode(self, inout w: json.Writer) { json.encode_record(self, inout w) }
-}
 
 impl Store {
     fn put(self, k: List[u8], v: List[u8]) -> Option[List[u8]] {
@@ -138,7 +131,10 @@ pub fn rpc(s: Store) -> jsonrpc.Table {
     })
     t.add("kv.stats", |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
         p.none()?
-        Ok(json.to_json(s.stats()))
+        match json.to_bytes(s.stats()) {
+            Ok(b) => Ok(b)
+            Err(e) => Err(jsonrpc.error(-32603, "cannot encode the statistics"))
+        }
     })
     t.add_typed("math.add", two_ints, jsonrpc.int, |x: Two| -> Result[i64, jsonrpc.Error] {
         // checked: an overflow is an error for the caller, not a trap in the server

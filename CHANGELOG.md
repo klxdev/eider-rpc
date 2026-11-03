@@ -3,6 +3,12 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+For Eider 0.6. Needs eider-json with `std/serial` support.
+
+- Method parameters and results are `serial.Deserialize` and `serial.Serialize` types (`@[derive(Serialize, Deserialize)]`), not `json.Decode` and `json.Encode`. A bad parameter is `-32602` with the serializer's path and message (`amountCents: expected a u32, the number is out of range`; no `$.` prefix).
+
 ## 0.5.0
 
 For Eider 0.5 (`eider = "0.5"`). Requires eider-http and eider-json 0.5.0. rpc/service is partial: eider-rpc#1 stays open (the per-method registration and stub are hand-written until trait reflection, eider-lang#154; Connect is not done).

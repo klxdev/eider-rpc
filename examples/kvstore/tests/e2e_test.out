@@ -12,8 +12,8 @@ true
 ! -32000 division by zero
 ! -32001 integer overflow
 = 42
-! -32602 Invalid params "$: unknown member \"c\""
-! -32602 Invalid params "$.b: expected an i64, found a string"
+! -32602 Invalid params "unknown field `c`"
+! -32602 Invalid params "b: expected an integer, found a string"
 = {"keys":1,"valueBytes":5}
 ! -32602 Invalid params "parameter key must be a string"
 ! -32601 Method not found

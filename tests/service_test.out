@@ -5,10 +5,10 @@
 {"jsonrpc":"2.0","result":2,"id":4}
 -- errors
 {"jsonrpc":"2.0","error":{"code":-32001,"message":"nothing to charge"},"id":5}
-{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"$.amountCents: not a u32 (out of range, or not an integer)"},"id":6}
-{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"$: missing member \"account\""},"id":7}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"amountCents: expected a u32, the number is out of range"},"id":6}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"missing field `account`"},"id":7}
 {"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"too many parameters"},"id":8}
-{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"$: unknown member \"bogus\""},"id":9}
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"unknown field `bogus`"},"id":9}
 {"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":"this method takes no parameters"},"id":10}
 {"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":11}
 (no response)

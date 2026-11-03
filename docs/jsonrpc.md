@@ -109,10 +109,10 @@ impl Billing for BillingClient {                         // the stub: one line a
 ```
 
 No decoder, encoder or schema is written: parameters and results go through eider-json's
-derived codecs (`@[json(...)]` applies). `add_json` takes a record `P`: a call's `params` object
+derived `Serialize` and `Deserialize` (`@[serial(...)]` and `@[json(...)]` apply). `add_json` takes a record `P`: a call's `params` object
 is its members, an `params` array is its fields in order (skipped fields don't count), absent
-`params` are `{}`; a parameter that doesn't fit is `-32602` with the JSONPath of the member
-(`$.amountCents: not a u32 ...`), a surplus positional parameter or an unknown member is an
+`params` are `{}`; a parameter that doesn't fit is `-32602` with the path of the member
+(`amountCents: expected a u32, ...`), a surplus positional parameter or an unknown member is an
 error too. `add_value` decodes any `P` from the `params` array or object itself and `add_none`
 is a method without parameters. `service.Remote` (`remote(addr, "/rpc")`, `call`, `call_none`)
 makes one request per call on its own connection, so it is a plain value usable from many

@@ -1,9 +1,10 @@
 //! rpc/service: typed services over JSON-RPC with no hand-written decoders or encoders. A
 //! method is a function from a parameter type `P` to `Result[R, Error]`; `P` and `R` are
-//! records, enums, lists... that have eider-json's derived codecs (`Decode`, `Encode`,
-//! `@[json(...)]` attributes apply), so the parameters are checked and converted by the same
-//! reflection that converts every other JSON value, and a bad parameter is `-32602 Invalid
-//! params` with the path of the offending member (`$.amount: not a u32 ...`).
+//! records, enums, lists... that are `serial.Serialize` and `serial.Deserialize` (derive them
+//! with `@[derive(Serialize, Deserialize)]`; `@[serial(...)]` and `@[json(...)]` apply), so the
+//! parameters are checked and converted by the same reflection that converts every other JSON
+//! value, and a bad parameter is `-32602 Invalid params` with the path of the offending member
+//! (`amount: expected a u32, ...`).
 //!
 //! A service is a trait of your own, and the same trait describes both ends:
 //!
@@ -32,13 +33,14 @@
 //!
 //! Parameters: `add_json` takes a record `P`: the call's `params` as an object are `P`'s
 //! members, as an array they are `P`'s fields in order (skipped fields don't count), absent
-//! they are `{}` (fine when every field is an Option or `@[json(default)]`). `add_value` takes any
+//! they are `{}` (fine when every field is an Option or `@[serial(default)]`). `add_value` takes any
 //! `P` and decodes the `params` array or object itself (a `List[i64]`, an enum), and `add_none`
 //! a method without parameters.
 
 import core.sys
 import std.bytes
 import std.net
+import std.serial
 import std.time
 import json
 import http
@@ -65,32 +67,28 @@ pub fn mount[S: Service](inout t: jsonrpc.Table, prefix: str, svc: S) {
     t = r.t
 }
 
-fn decode_failed(e: json.DecodeError) -> jsonrpc.Error {
-    jsonrpc.invalid_params(json.decode_error_text(e))
+fn decode_failed(e: serial.Error) -> jsonrpc.Error {
+    jsonrpc.invalid_params(serial.error_text(e))
 }
 
-/// The member names of record type P, in field order, skipped fields left out. `proto` only
-/// names the type.
-fn member_names[P](proto: Option[P]) -> List[List[u8]] {
-    let mut out: List[List[u8]] = List.new()
-    comptime for f in fields(P) {
-        comptime if !attr[json.json](f).skip {
-            out.push(json.member_name(f.name, attr[json.json](f).name, attr[json.json](P).rename_all))
-        }
+/// `r` as JSON text, or why it can't be (a NaN): an internal error.
+fn encoded[R: serial.Serialize](r: R) -> Result[List[u8], jsonrpc.Error] {
+    match json.to_bytes(r) {
+        Ok(b) => Ok(b)
+        Err(e) => Err(jsonrpc.error_data(jsonrpc.INTERNAL_ERROR, sys.lit("Invalid result"), json.quote(serial.error_text(e))))
     }
-    out
 }
 
 /// The call's parameters as a `P` (a record): an object is P's members, an array is its fields
 /// in order, no parameters are `{}`.
-pub fn params_as[P: json.Decode](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] {
+pub fn params_as[P: serial.Deserialize](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] {
     let mut d = p.doc.copy()
     let mut node = p.node.copy()
     if !p.present {
         node = json.new_object(inout d, List.new(), List.new())
     } else if !p.named() {
         let none: Option[P] = None
-        let names = member_names(none)
+        let names = serial.member_names(none, "json")
         if (json.len(d, node) as usize) > names.len() { return Err(jsonrpc.invalid_params(sys.lit("too many parameters"))) }
         let mut keys: List[List[u8]] = List.new()
         let mut vals: List[u32] = List.new()
@@ -100,18 +98,16 @@ pub fn params_as[P: json.Decode](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] 
         }
         node = json.new_object(inout d, keys, vals)
     }
-    let mut r = json.reader(d, node)
-    match P.decode(inout r) {
+    match P.deserialize(json.deserializer(d, node)) {
         Ok(x) => Ok(x)
         Err(e) => Err(decode_failed(e))
     }
 }
 
 /// The `params` node itself as a `P` (an array or object, whatever P decodes from).
-pub fn value_as[P: json.Decode](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] {
+pub fn value_as[P: serial.Deserialize](p: jsonrpc.Params) -> Result[P, jsonrpc.Error] {
     if !p.present { return Err(jsonrpc.invalid_params(sys.lit("parameters are required"))) }
-    let mut r = json.reader(p.doc, p.node)
-    match P.decode(inout r) {
+    match P.deserialize(json.deserializer(p.doc, p.node)) {
         Ok(x) => Ok(x)
         Err(e) => Err(decode_failed(e))
     }
@@ -121,34 +117,34 @@ impl Registry {
     fn full(self, name: str) -> List[u8] { bytes.concat(self.prefix, sys.lit(name)) }
 
     /// A method whose parameters are the members (or, positionally, the fields) of record P.
-    fn add_json[P: json.Decode, R: json.Encode](inout self, name: str, f: fn(P) -> Result[R, jsonrpc.Error]) {
+    fn add_json[P: serial.Deserialize, R: serial.Serialize](inout self, name: str, f: fn(P) -> Result[R, jsonrpc.Error]) {
         let full = self.full(name)
         self.t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
             let got: Result[P, jsonrpc.Error] = params_as(p)
             let args = got?
             let r = f(args)?
-            Ok(json.to_json(r))
+            encoded(r)
         })
     }
 
     /// A method whose parameters are the array or object that P decodes from.
-    fn add_value[P: json.Decode, R: json.Encode](inout self, name: str, f: fn(P) -> Result[R, jsonrpc.Error]) {
+    fn add_value[P: serial.Deserialize, R: serial.Serialize](inout self, name: str, f: fn(P) -> Result[R, jsonrpc.Error]) {
         let full = self.full(name)
         self.t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
             let got: Result[P, jsonrpc.Error] = value_as(p)
             let args = got?
             let r = f(args)?
-            Ok(json.to_json(r))
+            encoded(r)
         })
     }
 
     /// A method without parameters.
-    fn add_none[R: json.Encode](inout self, name: str, f: fn() -> Result[R, jsonrpc.Error]) {
+    fn add_none[R: serial.Serialize](inout self, name: str, f: fn() -> Result[R, jsonrpc.Error]) {
         let full = self.full(name)
         self.t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
             p.none()?
             let r = f()?
-            Ok(json.to_json(r))
+            encoded(r)
         })
     }
 }
@@ -171,16 +167,17 @@ impl Remote {
     /// Calls `method` with `params` encoded as JSON (a record: named parameters), and decodes
     /// the result as an `R`. A server's error comes back as it is; a failure to reach it is
     /// `TRANSPORT_ERROR`, a result that isn't an `R` is `INTERNAL_ERROR`.
-    fn call[P: json.Encode, R: json.Decode](self, method: str, params: P) -> Result[R, jsonrpc.Error] uses net, io, clock {
-        self.send(method, json.to_json(params))
+    fn call[P: serial.Serialize, R: serial.Deserialize](self, method: str, params: P) -> Result[R, jsonrpc.Error] uses net, io, clock {
+        let body = encoded(params)?
+        self.send(method, body)
     }
 
     /// `call` for a method without parameters.
-    fn call_none[R: json.Decode](self, method: str) -> Result[R, jsonrpc.Error] uses net, io, clock {
+    fn call_none[R: serial.Deserialize](self, method: str) -> Result[R, jsonrpc.Error] uses net, io, clock {
         self.send(method, List.new())
     }
 
-    fn send[R: json.Decode](self, method: str, params: List[u8]) -> Result[R, jsonrpc.Error] uses net, io, clock {
+    fn send[R: serial.Deserialize](self, method: str, params: List[u8]) -> Result[R, jsonrpc.Error] uses net, io, clock {
         let dl = time.after_ms(self.timeout_ms)
         let mut req = http.request("POST", self.target.copy())
         req.set_header("Content-Type", sys.lit("application/json"))
@@ -201,10 +198,9 @@ impl Remote {
         match reply {
             jsonrpc.Fault(e) => Err(e)
             jsonrpc.Value(d, node) => {
-                let mut rd = json.reader(d, node)
-                match R.decode(inout rd) {
+                match R.deserialize(json.deserializer(d, node)) {
                     Ok(v) => Ok(v)
-                    Err(e) => Err(jsonrpc.error_data(jsonrpc.INTERNAL_ERROR, sys.lit("Invalid result"), json.quote(json.decode_error_text(e))))
+                    Err(e) => Err(jsonrpc.error_data(jsonrpc.INTERNAL_ERROR, sys.lit("Invalid result"), json.quote(serial.error_text(e))))
                 }
             }
         }
