@@ -1,7 +1,7 @@
 //! rpc/service: typed services over JSON-RPC with no hand-written decoders or encoders. A
 //! method is a function from a parameter type `P` to `Result[R, Error]`; `P` and `R` are
 //! records, enums, lists... that have eider-json's derived codecs (`Decode`, `Encode`,
-//! `@json(...)` attributes apply), so the parameters are checked and converted by the same
+//! `@[json(...)]` attributes apply), so the parameters are checked and converted by the same
 //! reflection that converts every other JSON value, and a bad parameter is `-32602 Invalid
 //! params` with the path of the offending member (`$.amount: not a u32 ...`).
 //!
@@ -32,7 +32,7 @@
 //!
 //! Parameters: `add_json` takes a record `P`: the call's `params` as an object are `P`'s
 //! members, as an array they are `P`'s fields in order (skipped fields don't count), absent
-//! they are `{}` (fine when every field is an Option or `@json(default)`). `add_value` takes any
+//! they are `{}` (fine when every field is an Option or `@[json(default)]`). `add_value` takes any
 //! `P` and decodes the `params` array or object itself (a `List[i64]`, an enum), and `add_none`
 //! a method without parameters.
 

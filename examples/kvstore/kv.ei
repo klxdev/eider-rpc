@@ -74,7 +74,7 @@ fn two_ints(p: jsonrpc.Params) -> Result[Two, jsonrpc.Error] {
 }
 
 /// kv.stats's result, written by the derived encoder.
-@json(rename_all = "camelCase")
+@[json(rename_all = "camelCase")]
 type Stats = { keys: u64, value_bytes: u64 }
 
 impl json.Encode for Stats {

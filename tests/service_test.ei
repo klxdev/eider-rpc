@@ -14,12 +14,12 @@ import http.server
 import rpc.jsonrpc
 import rpc.service
 
-@json(rename_all = "camelCase")
+@[json(rename_all = "camelCase")]
 type Charge = { account: String, amount_cents: u32, memo: Option[String] }
 
 type Refund = { receipt: i64 }
 
-@json(tag = "state")
+@[json(tag = "state")]
 type Status =
     | Paid(receipt: i64)
     | Refunded(receipt: i64, reason: String)
