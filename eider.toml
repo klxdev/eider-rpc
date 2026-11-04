@@ -1,7 +1,7 @@
 [package]
 name = "rpc"
-version = "0.5.0"
-eider = "0.5"
+version = "0.6.0"
+eider = "0.6"
 # `import rpc` and `import rpc.jsonrpc` are the same module
 entry = "jsonrpc.ei"
 description = "JSON-RPC 2.0 over HTTP on eider-http: a dispatch table, typed methods, batches and notifications, the HTTP handler and a client (docs/jsonrpc.md)"
@@ -12,10 +12,10 @@ description = "JSON-RPC 2.0 over HTTP on eider-http: a dispatch table, typed met
 # docs/services.md, N14)
 [deps.http]
 git = "https://github.com/klxdev/eider-http.git"
-version = "0.5.0"
+version = "0.6.0"
 uses = ["net", "io", "clock", "threads", "fs"]
 
 # request and response bodies; pure, granted nothing
 [deps.json]
 git = "https://github.com/klxdev/eider-json.git"
-version = "0.5.0"
+version = "0.6.0"

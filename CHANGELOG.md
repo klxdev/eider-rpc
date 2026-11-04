@@ -3,9 +3,9 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.6.0
 
-For Eider 0.6. Needs eider-json with `std/serial` support.
+For Eider 0.6 (`eider = "0.6"`). Requires eider-json 0.6.0 (`std/serial` support).
 
 - Method parameters and results are `serial.Deserialize` and `serial.Serialize` types (`@[derive(Serialize, Deserialize)]`), not `json.Decode` and `json.Encode`. A bad parameter is `-32602` with the serializer's path and message (`amountCents: expected a u32, the number is out of range`; no `$.` prefix).
 
