@@ -14,6 +14,7 @@ import http
 import http.server
 import rpc.jsonrpc
 import rpc.service
+import rpc.remote
 
 @[derive(Serialize, Deserialize), serial(rename_all = "camelCase")]
 type Charge = { account: String, amount_cents: u32, memo: Option[String] }
@@ -65,7 +66,7 @@ impl service.Service for Ledger {
 }
 
 // the client implements the same trait: code written against Billing runs here or there
-type BillingClient = { remote: service.Remote }
+type BillingClient = { remote: remote.Remote }
 
 impl Billing for BillingClient {
     fn charge(self, req: Charge) -> Result[Receipt, jsonrpc.Error] uses net, io, clock { self.remote.call("billing.charge", req) }
@@ -125,13 +126,13 @@ fn main() uses io, net, clock, threads {
     let stop = tok
     let h = jsonrpc.handler(t)
     let running = spawn(|| -> server.Stats { srv.serve(h, stop).unwrap() })
-    let remote = BillingClient(service.remote(addr, "/rpc"))
-    show("charge", remote.charge(Charge(String.from("globex"), 99, Some(String.from("late fee")))))
-    show("charge", remote.charge(Charge(String.from("globex"), 0, None)))
-    show("refund", remote.refund(Refund(7)))
-    show("count", remote.count())
+    let bc = BillingClient(remote.new(addr, "/rpc"))
+    show("charge", bc.charge(Charge(String.from("globex"), 99, Some(String.from("late fee")))))
+    show("charge", bc.charge(Charge(String.from("globex"), 0, None)))
+    show("refund", bc.refund(Refund(7)))
+    show("count", bc.count())
     show("local count", ledger.count())
-    let dead = BillingClient(service.remote(net.ipv4(127, 0, 0, 1, 1), "/rpc").with_timeout_ms(500))
+    let dead = BillingClient(remote.new(net.ipv4(127, 0, 0, 1, 1), "/rpc").with_timeout_ms(500))
     match dead.count() {
         Ok(n) => print("?")
         Err(e) => print(e.code)

@@ -4,8 +4,8 @@ RPC services for [Eider](https://github.com/klxdev/eider-lang), on
 [eider-http](https://github.com/klxdev/eider-http) and
 [eider-json](https://github.com/klxdev/eider-json). Today that is JSON-RPC 2.0 over HTTP
 `POST` (`rpc/jsonrpc`): a dispatch table, typed methods (decoder, function, encoder),
-batches and notifications as the specification says, the HTTP handler and a client.
-`rpc/service` makes a service a trait of your own: methods are plain typed functions whose
+batches and notifications as the specification says, the HTTP handler and, in `rpc/client`, a client.
+`rpc/remote` is the typed client of a service. `rpc/service` makes a service a trait of your own: methods are plain typed functions whose
 parameters and results go through eider-json's derived codecs, with a one-line registration and
 client stub per method (generating those waits for trait reflection, eider-lang#154).
 
@@ -31,7 +31,7 @@ r.post("/rpc", jsonrpc.handler(t))      // r: an http/router Router
 [deps.rpc]
 git = "https://github.com/klxdev/eider-rpc.git"
 version = "0.1.0"
-uses = ["net", "io", "clock"]                 # for the client calls
+uses = ["net", "io", "clock"]                 # for the client calls (rpc/client, rpc/remote)
 
 [deps.http]
 git = "https://github.com/klxdev/eider-http.git"

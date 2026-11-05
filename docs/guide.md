@@ -266,13 +266,13 @@ import std.time
 import json
 import http.server
 import http.client
-import rpc.jsonrpc
+import rpc.client as rpcclient
 import notes
 
-fn show(r: Result[jsonrpc.Reply, String]) uses io {
+fn show(r: Result[rpcclient.Reply, String]) uses io {
     match r {
-        Ok(jsonrpc.Value(d, n)) => print(String.from_bytes(json.write(d, n)).unwrap())
-        Ok(jsonrpc.Fault(e)) => print(e.code)
+        Ok(rpcclient.Value(d, n)) => print(String.from_bytes(json.write(d, n)).unwrap())
+        Ok(rpcclient.Fault(e)) => print(e.code)
         Err(e) => print(e)
     }
 }
@@ -287,9 +287,9 @@ fn main() uses io, net, clock, threads {
     let running = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
 
     let mut c = client.connect(addr, dl).unwrap()
-    show(jsonrpc.call(inout c, "/rpc", "notes.add", String.from("[\"buy milk\"]").bytes(), 1, dl))
-    show(jsonrpc.call(inout c, "/rpc", "notes.get", String.from("[1]").bytes(), 2, dl))
-    show(jsonrpc.call(inout c, "/rpc", "notes.add", String.from("[\"\"]").bytes(), 3, dl))
+    show(rpcclient.call(inout c, "/rpc", "notes.add", String.from("[\"buy milk\"]").bytes(), 1, dl))
+    show(rpcclient.call(inout c, "/rpc", "notes.get", String.from("[1]").bytes(), 2, dl))
+    show(rpcclient.call(inout c, "/rpc", "notes.add", String.from("[\"\"]").bytes(), 3, dl))
 
     tok.cancel()                   // graceful shutdown
     print(running.join().requests)

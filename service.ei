@@ -21,6 +21,7 @@
 //!         }
 //!     }
 //!     impl Billing for BillingClient { ... }              // a stub: `self.remote.call("billing.charge", req)`
+//!                                                          // (`rpc/remote`, the typed client, is a module of its own)
 //!
 //!     service.mount(inout table, "billing", ledger)       // methods billing.charge, billing.refund
 //!
@@ -39,16 +40,10 @@
 
 import core.sys
 import std.bytes
-import std.net
 import std.serial
-import std.time
 import json
 import http
-import http.client
 import rpc.jsonrpc
-
-/// -32000: the call did not get an answer (no connection, deadline, HTTP error).
-pub const TRANSPORT_ERROR: i64 = -32000
 
 /// Methods are added under a prefix (`billing.`).
 pub type Registry = { t: jsonrpc.Table, prefix: List[u8] }
@@ -72,7 +67,7 @@ fn decode_failed(e: serial.Error) -> jsonrpc.Error {
 }
 
 /// `r` as JSON text, or why it can't be (a NaN): an internal error.
-fn encoded[R: serial.Serialize](r: R) -> Result[List[u8], jsonrpc.Error] {
+pub fn encoded[R: serial.Serialize](r: R) -> Result[List[u8], jsonrpc.Error] {
     match json.to_bytes(r) {
         Ok(b) => Ok(b)
         Err(e) => Err(jsonrpc.error_data(jsonrpc.INTERNAL_ERROR, sys.lit("Invalid result"), json.quote(serial.error_text(e))))
@@ -146,63 +141,5 @@ impl Registry {
             let r = f()?
             encoded(r)
         })
-    }
-}
-
-// ---- client
-
-/// A service at `target` (`/rpc`) of the server at `addr`: each call is one request on a
-/// connection of its own, so a `Remote` is a plain value that any number of threads may call.
-pub type Remote = { addr: net.Addr, target: List[u8], timeout_ms: i64 }
-
-pub fn remote(addr: net.Addr, target: str) -> Remote { Remote(addr, sys.lit(target), 5000) }
-
-fn transport(msg: String) -> jsonrpc.Error {
-    jsonrpc.error_data(TRANSPORT_ERROR, sys.lit("Transport error"), json.quote(msg.bytes()))
-}
-
-impl Remote {
-    fn with_timeout_ms(self, ms: i64) -> Remote { Remote(self.addr, self.target.copy(), ms) }
-
-    /// Calls `method` with `params` encoded as JSON (a record: named parameters), and decodes
-    /// the result as an `R`. A server's error comes back as it is; a failure to reach it is
-    /// `TRANSPORT_ERROR`, a result that isn't an `R` is `INTERNAL_ERROR`.
-    fn call[P: serial.Serialize, R: serial.Deserialize](self, method: str, params: P) -> Result[R, jsonrpc.Error] uses net, io, clock {
-        let body = encoded(params)?
-        self.send(method, body)
-    }
-
-    /// `call` for a method without parameters.
-    fn call_none[R: serial.Deserialize](self, method: str) -> Result[R, jsonrpc.Error] uses net, io, clock {
-        self.send(method, List.new())
-    }
-
-    fn send[R: serial.Deserialize](self, method: str, params: List[u8]) -> Result[R, jsonrpc.Error] uses net, io, clock {
-        let dl = time.after_ms(self.timeout_ms)
-        let mut req = http.request("POST", self.target.copy())
-        req.set_header("Content-Type", sys.lit("application/json"))
-        req.body = jsonrpc.request_body(sys.lit(method), params, Some(1))
-        let resp = match client.fetch(self.addr, req, dl) {
-            Ok(r) => r
-            Err(m) => { return Err(transport(m)) }
-        }
-        if resp.status != 200 {
-            let mut m = String.from("HTTP status ")
-            m.append(String.from_int(resp.status as i64))
-            return Err(transport(m))
-        }
-        let reply = match jsonrpc.parse_reply(resp.body, 1) {
-            Ok(x) => x
-            Err(m) => { return Err(transport(m)) }
-        }
-        match reply {
-            jsonrpc.Fault(e) => Err(e)
-            jsonrpc.Value(d, node) => {
-                match R.deserialize(json.deserializer(d, node)) {
-                    Ok(v) => Ok(v)
-                    Err(e) => Err(jsonrpc.error_data(jsonrpc.INTERNAL_ERROR, sys.lit("Invalid result"), json.quote(serial.error_text(e))))
-                }
-            }
-        }
     }
 }

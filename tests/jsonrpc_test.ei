@@ -8,6 +8,7 @@ import std.io
 import json
 import http
 import rpc.jsonrpc
+import rpc.client as rpcclient
 
 type Pair = { a: i64, b: i64 }
 
@@ -85,10 +86,10 @@ fn show_http(r: http.Response) uses io {
     io.outln(l)
 }
 
-fn show_reply(r: Result[jsonrpc.Reply, String]) uses io {
+fn show_reply(r: Result[rpcclient.Reply, String]) uses io {
     match r {
-        Ok(jsonrpc.Value(d, n)) => io.outln(bytes.concat(sys.lit("value "), json.write(d, n)))
-        Ok(jsonrpc.Fault(e)) => {
+        Ok(rpcclient.Value(d, n)) => io.outln(bytes.concat(sys.lit("value "), json.write(d, n)))
+        Ok(rpcclient.Fault(e)) => {
             let mut l = sys.lit("fault ")
             bytes.append(inout l, bytes.from_i64(e.code))
             l.push(32)
@@ -155,14 +156,14 @@ fn main() uses io {
     show_http(h(post))
 
     print("-- the client's view of replies")
-    io.outln(jsonrpc.request_body(sys.lit("subtract"), sys.lit("[42,23]"), Some(7)))
-    io.outln(jsonrpc.request_body(sys.lit("update"), List.new(), None))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":{{\"a\":[1,2]}},\"id\":7}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}},\"id\":7}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32700,\"message\":\"Parse error\",\"data\":\"x\"}},\"id\":null}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":1,\"id\":8}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":1,\"error\":{{}},\"id\":7}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"result\":1,\"id\":7}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":1}}"), 7))
-    show_reply(jsonrpc.parse_reply(sys.lit("not json"), 7))
+    io.outln(rpcclient.request_body(sys.lit("subtract"), sys.lit("[42,23]"), Some(7)))
+    io.outln(rpcclient.request_body(sys.lit("update"), List.new(), None))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":{{\"a\":[1,2]}},\"id\":7}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}},\"id\":7}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32700,\"message\":\"Parse error\",\"data\":\"x\"}},\"id\":null}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":1,\"id\":8}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":1,\"error\":{{}},\"id\":7}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"result\":1,\"id\":7}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("{{\"jsonrpc\":\"2.0\",\"result\":1}}"), 7))
+    show_reply(rpcclient.parse_reply(sys.lit("not json"), 7))
 }

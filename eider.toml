@@ -6,9 +6,8 @@ eider = "0.7"
 entry = "jsonrpc.ei"
 description = "JSON-RPC 2.0 over HTTP on eider-http: a dispatch table, typed methods, batches and notifications, the HTTP handler and a client (docs/jsonrpc.md)"
 
-# the HTTP types and the client calls (`call`, `notify`): sockets and deadlines. rpc's own
-# code asks for nothing more than its client calls do, but a grant is checked against what
-# the program loads of http, so it grants what http's modules use (eider-http's
+# the HTTP types, the handler and the client calls: sockets and deadlines. A grant is checked
+# against what the program loads of http, so it grants what http's modules use (eider-http's
 # docs/services.md, N14)
 [deps.http]
 git = "https://github.com/klxdev/eider-http.git"

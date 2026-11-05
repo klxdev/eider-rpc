@@ -44,8 +44,10 @@ calls of a batch run one after another on the connection's worker.
 
 Over HTTP (`handler(table)`): `POST` with `Content-Type: application/json` (else 405 /
 415), `200` with the response, or `204` when there is nothing to send back. The client side
-has `call` and `notify` on an eider-http `client.Conn`, and `parse_reply`, which checks the
-version, the id and that there is exactly one of `result` and `error`.
+is `rpc/client`, a module of its own (`import rpc.client as rpcclient`, since eider-http has a
+`client` too): `call` and `notify` on an eider-http `client.Conn`, `request_body`, and
+`parse_reply`, which checks the version, the id and that there is exactly one of `result` and
+`error`; `Reply` (`Value` or `Fault`) is its result type.
 
 ## Limits
 
@@ -60,9 +62,16 @@ docs/services.md, "Limits and defaults".
 
 ## Capabilities
 
-The module's server side needs nothing; `call` and `notify` need `net, io, clock`. A
-program grants rpc `net, io, clock` and http what its server needs (`net, io, clock,
-threads`, and `fs` for http/profiling's endpoints): examples/kvstore/eider.toml.
+`rpc/jsonrpc` and `rpc/service` (the server side) have no `uses` of their own; the client
+calls, in `rpc/client` and `rpc/remote`, need `net, io, clock`. The compiler checks a grant
+against the modules a program loads of a package, so a program that imports only
+`rpc.jsonrpc` and `rpc.service` is not held to `net, io, clock` for rpc (eider-rpc#2). But
+`eider-pkg` computes the grant it records in eider.lock over *every* module of a package
+(eider-lang's docs/site/guide/capabilities.md, "Known limits"), so `eider fetch` still asks
+for `net, io, clock` for rpc until grants are per imported module (eider-lang#60) or the
+client is a package of its own. A program grants rpc `net, io, clock` and http what its server
+needs (`net, io, clock, threads`, and `fs` for http/profiling's endpoints):
+examples/kvstore/eider.toml.
 
 ## Testing
 
@@ -114,7 +123,7 @@ is its members, an `params` array is its fields in order (skipped fields don't c
 `params` are `{}`; a parameter that doesn't fit is `-32602` with the path of the member
 (`amountCents: expected a u32, ...`), a surplus positional parameter or an unknown member is an
 error too. `add_value` decodes any `P` from the `params` array or object itself and `add_none`
-is a method without parameters. `service.Remote` (`remote(addr, "/rpc")`, `call`, `call_none`)
+is a method without parameters. `remote.Remote` (in `rpc/remote`: `remote.new(addr, "/rpc")`, `call`, `call_none`)
 makes one request per call on its own connection, so it is a plain value usable from many
 threads; a server's error comes back as it was, an unreachable server is `-32000`, a result
 that isn't an `R` is `-32603`. Because the client implements the trait too, code written

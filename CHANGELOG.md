@@ -3,6 +3,13 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+For Eider 0.7 (`eider = "0.7"`). A breaking move, before 1.0 (eider-rpc#2, partly):
+
+- The client is in modules of its own, so that the server side has no `uses`: `rpc/client` has `call`, `notify`, `request_body`, `parse_reply` and `Reply` (`Value`, `Fault`), formerly in `rpc/jsonrpc` (`import rpc.client as rpcclient`; eider-http has a `client` module too); `rpc/remote` has the typed client `Remote` (`remote.new(addr, target)`, formerly `service.remote`) and `TRANSPORT_ERROR`, formerly in `rpc/service`. `service.encoded` is public. `rpc/jsonrpc` and `rpc/service` no longer import `http.client` or `std.time`.
+- The compiler now holds a program that imports only `rpc.jsonrpc` and `rpc.service` to no grant for rpc (checked: a server-only `main` compiles with `uses = []`). It is not enough for `eider fetch`: eider-pkg computes a dependency's grant over every module of the package, so `[deps.rpc]` still needs `uses = ["net", "io", "clock"]` in eider.lock until eider-lang#60 (grants per imported module) lands or the client moves to a package (a repository) of its own. eider-rpc#2 stays open for that.
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-http and eider-json 0.7.0. Nothing else changed.

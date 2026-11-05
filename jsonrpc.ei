@@ -24,16 +24,13 @@
 //! Results are written in the order of the calls (the spec allows any order). Calls in a
 //! batch run one after another on the connection's worker.
 //!
-//! Client side: `call` sends one request on a client.Conn and returns the result or the
-//! error; `notify` sends a notification.
+//! The client is `rpc/client` (`call`, `notify`), a module of its own: serving needs no grants.
 
 import core.sys
 import std.bytes
 import std.profile
-import std.time
 import json
 import http
-import http.client
 
 pub const PARSE_ERROR: i64 = -32700
 pub const INVALID_REQUEST: i64 = -32600
@@ -317,106 +314,4 @@ pub fn handler(t: Table) -> http.Handler {
             None => http.response(204)
         }
     }
-}
-
-// ---- client
-
-/// What a call returned: its result (`node` in `doc`) or its error.
-pub type Reply = | Value(doc: json.Doc, node: u32) | Fault(e: Error)
-
-/// A request body: `params` is JSON text (an array or object; empty for none); `id` None
-/// makes it a notification.
-pub fn request_body(method: List[u8], params: List[u8], id: Option[i64]) -> List[u8] {
-    let mut out = sys.lit("{{\"jsonrpc\":\"2.0\",\"method\":")
-    json.quote_into(inout out, method)
-    if params.len() > 0 {
-        bytes.append(inout out, sys.lit(",\"params\":"))
-        bytes.append(inout out, params)
-    }
-    match id {
-        Some(n) => {
-            bytes.append(inout out, sys.lit(",\"id\":"))
-            bytes.append(inout out, bytes.from_i64(n))
-        }
-        None => {}
-    }
-    out.push(125)
-    out
-}
-
-/// A response body to a call with `id`: Err when it isn't a valid JSON-RPC 2.0 response to it.
-pub fn parse_reply(body: List[u8], id: i64) -> Result[Reply, String] {
-    let d = match json.parse(body) {
-        Ok(x) => x
-        Err(e) => {
-            let mut m = String.from("jsonrpc: response is not JSON: ")
-            m.append(sys.to_string(json.error_text(e)))
-            return Err(m)
-        }
-    }
-    let r = d.root
-    let ok_version = match json.field(d, r, "jsonrpc") {
-        Some(v) => bytes.eq(json.as_str(d, v).unwrap_or(List.new()), sys.lit("2.0"))
-        None => false
-    }
-    if json.kind(d, r) != json.OBJECT || !ok_version { return Err(String.from("jsonrpc: not a JSON-RPC 2.0 response")) }
-    let res = json.field(d, r, "result")
-    let er = json.field(d, r, "error")
-    match json.field(d, r, "id") {
-        Some(i) => {
-            if json.as_int(d, i) != Some(id) && !(er.is_some() && json.is_null(d, i)) {
-                return Err(String.from("jsonrpc: response for another id"))
-            }
-        }
-        None => { return Err(String.from("jsonrpc: response without an id")) }
-    }
-    if res.is_some() == er.is_some() { return Err(String.from("jsonrpc: a response has exactly one of result and error")) }
-    match res {
-        Some(n) => { return Ok(Value(d, n)) }
-        None => {}
-    }
-    let e = er.unwrap()
-    let code: Option[i64] = match json.field(d, e, "code") {
-        Some(c) => json.as_int(d, c)
-        None => None
-    }
-    let msg: Option[List[u8]] = match json.field(d, e, "message") {
-        Some(m) => json.as_str(d, m)
-        None => None
-    }
-    if code.is_none() || msg.is_none() { return Err(String.from("jsonrpc: malformed error object")) }
-    let data: List[u8] = match json.field(d, e, "data") {
-        Some(x) => json.write(d, x)
-        None => List.new()
-    }
-    Ok(Fault(Error(code.unwrap(), msg.unwrap(), data)))
-}
-
-fn post(inout c: client.Conn, target: List[u8], body: List[u8], dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
-    let mut req = http.request("POST", target)
-    req.set_header("Content-Type", sys.lit("application/json"))
-    req.body = body
-    c.request(req, dl)
-}
-
-/// Calls `method` with `params` (JSON text; empty for none) at `target` on `c`, with id `id`.
-pub fn call(inout c: client.Conn, target: str, method: str, params: List[u8], id: i64, dl: time.Deadline) -> Result[Reply, String] uses net, io, clock {
-    let resp = post(inout c, sys.lit(target), request_body(sys.lit(method), params, Some(id)), dl)?
-    if resp.status != 200 {
-        let mut m = String.from("jsonrpc: HTTP status ")
-        m.append(String.from_int(resp.status as i64))
-        return Err(m)
-    }
-    parse_reply(resp.body, id)
-}
-
-/// Sends a notification (no reply expected: Ok when the server answered 204).
-pub fn notify(inout c: client.Conn, target: str, method: str, params: List[u8], dl: time.Deadline) -> Result[bool, String] uses net, io, clock {
-    let resp = post(inout c, sys.lit(target), request_body(sys.lit(method), params, None), dl)?
-    if resp.status != 204 {
-        let mut m = String.from("jsonrpc: HTTP status ")
-        m.append(String.from_int(resp.status as i64))
-        return Err(m)
-    }
-    Ok(true)
 }

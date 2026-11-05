@@ -15,12 +15,13 @@ import http
 import http.server
 import http.client
 import rpc.jsonrpc
+import rpc.client as rpcclient
 import kvstore.kv
 
-fn show(r: Result[jsonrpc.Reply, String]) uses io {
+fn show(r: Result[rpcclient.Reply, String]) uses io {
     match r {
-        Ok(jsonrpc.Value(d, n)) => io.outln(bytes.concat(sys.lit("= "), json.write(d, n)))
-        Ok(jsonrpc.Fault(e)) => {
+        Ok(rpcclient.Value(d, n)) => io.outln(bytes.concat(sys.lit("= "), json.write(d, n)))
+        Ok(rpcclient.Fault(e)) => {
             let mut l = sys.lit("! ")
             bytes.append(inout l, bytes.from_i64(e.code))
             l.push(32)
@@ -49,25 +50,25 @@ fn main() uses io, net, clock, threads {
 
     print("-- calls on one connection")
     let mut c = client.connect(addr, dl).unwrap()
-    show(jsonrpc.call(inout c, "/rpc", "kv.put", sys.lit("[\"lang\", \"eider\"]"), 1, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.put", sys.lit("{{\"key\": \"lang\", \"value\": \"Eider\"}}"), 2, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.get", sys.lit("[\"lang\"]"), 3, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.get", sys.lit("[\"missing\"]"), 4, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.put", sys.lit("[\"tmp\", \"x\"]"), 5, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.keys", List.new(), 6, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.delete", sys.lit("[\"tmp\"]"), 7, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.delete", sys.lit("[\"tmp\"]"), 8, dl))
-    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("[40, 2]"), 9, dl))
-    show(jsonrpc.call(inout c, "/rpc", "math.div", sys.lit("{{\"a\": 7, \"b\": 0}}"), 10, dl))
-    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("[9223372036854775807, 1]"), 11, dl))
-    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("{{\"a\": 40, \"b\": 2}}"), 31, dl))
-    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("{{\"a\": 40, \"b\": 2, \"c\": 1}}"), 32, dl))
-    show(jsonrpc.call(inout c, "/rpc", "math.add", sys.lit("{{\"a\": 40, \"b\": \"2\"}}"), 33, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.stats", List.new(), 34, dl))
-    show(jsonrpc.call(inout c, "/rpc", "kv.get", sys.lit("[1]"), 12, dl))
-    show(jsonrpc.call(inout c, "/rpc", "no.such", List.new(), 13, dl))
-    print(jsonrpc.notify(inout c, "/rpc", "kv.put", sys.lit("[\"quiet\", \"yes\"]"), dl).unwrap())
-    show(jsonrpc.call(inout c, "/rpc", "kv.get", sys.lit("[\"quiet\"]"), 14, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.put", sys.lit("[\"lang\", \"eider\"]"), 1, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.put", sys.lit("{{\"key\": \"lang\", \"value\": \"Eider\"}}"), 2, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.get", sys.lit("[\"lang\"]"), 3, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.get", sys.lit("[\"missing\"]"), 4, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.put", sys.lit("[\"tmp\", \"x\"]"), 5, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.keys", List.new(), 6, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.delete", sys.lit("[\"tmp\"]"), 7, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.delete", sys.lit("[\"tmp\"]"), 8, dl))
+    show(rpcclient.call(inout c, "/rpc", "math.add", sys.lit("[40, 2]"), 9, dl))
+    show(rpcclient.call(inout c, "/rpc", "math.div", sys.lit("{{\"a\": 7, \"b\": 0}}"), 10, dl))
+    show(rpcclient.call(inout c, "/rpc", "math.add", sys.lit("[9223372036854775807, 1]"), 11, dl))
+    show(rpcclient.call(inout c, "/rpc", "math.add", sys.lit("{{\"a\": 40, \"b\": 2}}"), 31, dl))
+    show(rpcclient.call(inout c, "/rpc", "math.add", sys.lit("{{\"a\": 40, \"b\": 2, \"c\": 1}}"), 32, dl))
+    show(rpcclient.call(inout c, "/rpc", "math.add", sys.lit("{{\"a\": 40, \"b\": \"2\"}}"), 33, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.stats", List.new(), 34, dl))
+    show(rpcclient.call(inout c, "/rpc", "kv.get", sys.lit("[1]"), 12, dl))
+    show(rpcclient.call(inout c, "/rpc", "no.such", List.new(), 13, dl))
+    print(rpcclient.notify(inout c, "/rpc", "kv.put", sys.lit("[\"quiet\", \"yes\"]"), dl).unwrap())
+    show(rpcclient.call(inout c, "/rpc", "kv.get", sys.lit("[\"quiet\"]"), 14, dl))
     print(c.open)
 
     print("-- a batch, and the REST side")
@@ -96,9 +97,9 @@ fn main() uses io, net, clock, threads {
                 let mut params = sys.lit("[")
                 json.quote_into(inout params, key)
                 bytes.append(inout params, sys.lit(", \"v\"]"))
-                match jsonrpc.call(inout cc, "/rpc", "kv.put", params, i as i64, tk.bound(dl))? {
-                    jsonrpc.Value(d, n) => { stored += 1 }
-                    jsonrpc.Fault(e) => { return Err(sys.to_string(e.message)) }
+                match rpcclient.call(inout cc, "/rpc", "kv.put", params, i as i64, tk.bound(dl))? {
+                    rpcclient.Value(d, n) => { stored += 1 }
+                    rpcclient.Fault(e) => { return Err(sys.to_string(e.message)) }
                 }
             }
             cc.close()
@@ -108,9 +109,9 @@ fn main() uses io, net, clock, threads {
     let mut total: i64 = 0
     for n in g.wait().unwrap() { total += n }
     print(total)
-    match jsonrpc.call(inout c, "/rpc", "kv.keys", List.new(), 15, dl).unwrap() {
-        jsonrpc.Value(d, n) => print(json.len(d, n))
-        jsonrpc.Fault(e) => print("fault")
+    match rpcclient.call(inout c, "/rpc", "kv.keys", List.new(), 15, dl).unwrap() {
+        rpcclient.Value(d, n) => print(json.len(d, n))
+        rpcclient.Fault(e) => print("fault")
     }
     c.close()
 
