@@ -3,7 +3,7 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.1
 
 For Eider 0.7 (`eider = "0.7"`). A breaking move, before 1.0 (eider-rpc#2, partly):
 
