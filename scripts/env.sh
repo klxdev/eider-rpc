@@ -26,7 +26,7 @@
 # $toolchain/.vendor/<name> (fetched there and hash-checked by its scripts/vendor.sh on first
 # use). A dependency with none of these is fetched from its repository (network).
 # DEPS: the git packages in this repository's dependency graph (transitive ones included).
-DEPS="http json logging"
+DEPS="http json logging compression tls"
 
 die() { echo "$(basename "$0"): $*" >&2; exit 2; }
 install_hint="install eider (gh release download --repo klxdev/eider-lang --pattern install.sh && sh install.sh --toolchain; eider-lang's docs/site/tooling/eider.md), or set EIDER_TOOLCHAIN to an Eider toolchain or an eider-lang checkout"
