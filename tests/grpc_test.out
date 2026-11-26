@@ -25,6 +25,8 @@ DEADLINE_EXCEEDED: the deadline passed
 done in time: 20
 -- the client cancels a call
 CANCELLED: the call was cancelled
+-- gzip: a compressed request and a compressed response (the handler asks for it; the caller accepts it)
+compressed round trip, reply bytes: 50007
 -- the connection is still good after all that
 Hello, again
 -- the same service over Connect (JSON and protobuf bodies) and JSON-RPC

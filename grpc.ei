@@ -20,8 +20,10 @@
 //! reset by the peer is `CANCELLED` (or what its error code maps to); a handler that traps is `INTERNAL`; an HTTP error from
 //! a non-gRPC server maps to the status the specification gives. A message over `max_recv` (4 MiB) is `RESOURCE_EXHAUSTED`.
 //!
-//! Compression is off: nothing is sent compressed, `grpc-accept-encoding: identity` is announced, and a message that arrives
-//! with the compressed flag is `UNIMPLEMENTED`.
+//! Compression: gzip, per message, off unless asked. A client asks with `CallOpts.with_compression()` (`grpc-encoding: gzip`), a handler
+//! with `Ctx.set_compression(true)` (used when the caller's `grpc-accept-encoding` has gzip); `grpc-accept-encoding: gzip,identity` is
+//! always announced and a compressed message is always understood. Decompression is bounded by the receive limit and eider-compression's
+//! ratio limit (`RESOURCE_EXHAUSTED`), a bad gzip stream is `INTERNAL`, another `grpc-encoding` is `UNIMPLEMENTED`.
 
 import core.sys
 import std.bytes
@@ -33,6 +35,8 @@ import std.time
 import http
 import http.h2
 import http.h2frame
+import compression
+import compression.gzip
 import rpc.def
 
 // ---- framing, metadata, timeouts ----
@@ -47,6 +51,14 @@ pub fn frame(msg: List[u8]) -> List[u8] {
     out.push(((n >> 8) & 255) as u8)
     out.push((n & 255) as u8)
     out.extend(msg)
+    out
+}
+
+/// `frame`, with the message gzip-compressed (flag byte 1) when `gz`.
+pub fn frame_with(msg: List[u8], gz: bool) -> List[u8] {
+    if !gz { return frame(msg) }
+    let mut out = frame(gzip.compress(msg, 6))
+    out[0] = 1
     out
 }
 
@@ -218,7 +230,7 @@ pub fn is_grpc(hs: List[http.Header]) -> bool {
 // ---- reading messages ----
 
 /// A stream's incoming messages, reassembled from DATA.
-type Reader = { st: h2.Stream, buf: List[u8], max: usize, ended: bool }
+type Reader = { st: h2.Stream, buf: List[u8], max: usize, ended: bool, gz: bool }
 
 fn next_msg(inout r: Reader, dl: time.Deadline) -> Result[Option[List[u8]], def.Status] uses io, clock {
     while true {
@@ -229,8 +241,17 @@ fn next_msg(inout r: Reader, dl: time.Deadline) -> Result[Option[List[u8]], def.
             if r.buf.len() >= 5 + n {
                 let msg = r.buf.slice(5, 5 + n)
                 r.buf.remove_range(0, 5 + n)
-                if flag != 0 { return Err(def.status(def.UNIMPLEMENTED, "compressed messages are not supported (grpc-encoding: identity)")) }
-                return Ok(Some(msg))
+                if flag == 0 { return Ok(Some(msg)) }
+                if flag != 1 { return Err(def.status(def.INTERNAL, "a bad message flag")) }
+                if !r.gz { return Err(def.status(def.INTERNAL, "a compressed message without a grpc-encoding that says how")) }
+                // a decompression bomb is bounded by the receive limit (and the ratio limit of eider-compression)
+                match gzip.decompress_with(msg, compression.limit_output(r.max as u64)) {
+                    Ok(plain) => { return Ok(Some(plain)) }
+                    Err(e) => {
+                        if e.kind == compression.TooLarge || e.kind == compression.RatioExceeded { return Err(def.status(def.RESOURCE_EXHAUSTED, "a compressed message expands past the receive limit")) }
+                        return Err(def.status(def.INTERNAL, "a compressed message is not valid gzip"))
+                    }
+                }
             }
         }
         if r.ended {
@@ -251,11 +272,12 @@ fn next_msg(inout r: Reader, dl: time.Deadline) -> Result[Option[List[u8]], def.
 
 fn content_type() -> List[u8] { "application/grpc".bytes() }
 
-fn head_fields(extra: List[http.Header]) -> List[http.Header] {
+fn head_fields(extra: List[http.Header], gz: bool) -> List[http.Header] {
     let mut hs: List[http.Header] = List.new()
     hs.push(http.Header(":status".bytes(), "200".bytes()))
     hs.push(http.Header("content-type".bytes(), content_type()))
-    hs.push(http.Header("grpc-accept-encoding".bytes(), "identity".bytes()))
+    hs.push(http.Header("grpc-accept-encoding".bytes(), "gzip,identity".bytes()))
+    if gz { hs.push(http.Header("grpc-encoding".bytes(), "gzip".bytes())) }
     for f in metadata_fields(extra) { hs.push(f) }
     hs
 }
@@ -271,9 +293,16 @@ fn status_fields(st: def.Status, trailers: List[http.Header]) -> List[http.Heade
 
 /// Ends a call that has not sent its head: headers only, with the status ("trailers-only").
 fn trailers_only(s: h2.Stream, st: def.Status, ctx: def.Ctx) uses io, clock {
-    let mut hs = head_fields(ctx.headers_out())
+    let mut hs = head_fields(ctx.headers_out(), false)
     for f in status_fields(st, ctx.trailers_out()) { hs.push(f) }
     let z = s.send_headers(hs, true)
+}
+
+fn lists_gzip(v: List[u8]) -> bool {
+    for t in http.list_items(v) {
+        if http.eq_ci_s(t, "gzip") { return true }
+    }
+    false
 }
 
 /// Serves one gRPC stream (its head is already known to be gRPC).
@@ -306,13 +335,22 @@ fn serve_stream(services: List[def.Service], max_recv: usize, s: h2.Stream, head
             return
         }
     }
+    let mut req_gz = false
     match http.find_s(head, "grpc-encoding") {
         Some(enc) => {
-            if !http.eq_s(enc, "identity") {
-                trailers_only(s, def.status(def.UNIMPLEMENTED, "unsupported grpc-encoding (identity only)"), blank)
+            if http.eq_s(enc, "gzip") {
+                req_gz = true
+            } else if !http.eq_s(enc, "identity") {
+                trailers_only(s, def.status(def.UNIMPLEMENTED, "unsupported grpc-encoding (gzip and identity)"), blank)
                 return
             }
         }
+        None => {}
+    }
+    // the response is compressed when the handler asks (`Ctx.set_compression`) and the caller accepts gzip
+    let mut accepts_gz = false
+    match http.find_s(head, "grpc-accept-encoding") {
+        Some(a) => { accepts_gz = lists_gzip(a) }
         None => {}
     }
     let mut dl = time.never()
@@ -333,7 +371,7 @@ fn serve_stream(services: List[def.Service], max_recv: usize, s: h2.Stream, head
     name.push_str("/")
     name.append(String.from_bytes(m_name.copy()).unwrap_or(String.from("")))
     let ctx = def.ctx(name, metadata_of(head), dl, String.from(""))
-    let rd = sync.lock(Reader(s, List.new(), max_recv, false))
+    let rd = sync.lock(Reader(s, List.new(), max_recv, false, req_gz))
     let sent = sync.lock(false)
     let rawin = def.RawIn(|| -> Result[Option[List[u8]], def.Status] {
         rd.modify(|inout r: Reader| -> Result[Option[List[u8]], def.Status] { next_msg(inout r, dl) })
@@ -345,12 +383,12 @@ fn serve_stream(services: List[def.Service], max_recv: usize, s: h2.Stream, head
             !was
         })
         if first {
-            match s.send_headers(head_fields(ctx.headers_out()), false) {
+            match s.send_headers(head_fields(ctx.headers_out(), ctx.compression() && accepts_gz), false) {
                 Ok(z) => {}
                 Err(e) => { return Err(from_h2(e)) }
             }
         }
-        match s.send(frame(b), false, dl) {
+        match s.send(frame_with(b, ctx.compression() && accepts_gz), false, dl) {
             Ok(z) => Ok(())
             Err(e) => Err(from_h2(e))
         }
@@ -416,33 +454,140 @@ pub fn middleware(services: List[def.Service]) -> h2.Middleware uses io, clock {
 
 // ---- the client ----
 
-/// A connection to a gRPC server: an `h2.Client` and what every call puts in its head.
-pub type Channel = { c: h2.Client, authority: List[u8], scheme: List[u8], user_agent: List[u8], max_recv: usize }
+/// How a channel retries a unary call that failed `UNAVAILABLE` (the connection broke, the server was not ready): up to `max_attempts`
+/// in all (1: no retry), waiting `initial_ms` before the second and doubling up to `max_ms`, within the call's own timeout.
+pub type Retry = { max_attempts: i32, initial_ms: i64, max_ms: i64 }
+
+/// A connection to a gRPC server: an `h2.Client` (the current one; a channel made with `dial_channel` replaces it when it has ended)
+/// and what every call puts in its head.
+pub type Channel = {
+    cur: sync.Lock[h2.Client],
+    dial: Option[fn() -> Result[h2.Client, String]],
+    authority: List[u8],
+    user_agent: List[u8],
+    max_recv: usize,
+    retry: Retry,
+}
 
 /// A channel over `c` (`h2.dial`, `secure.connect_h2`, or `h2.connect` over any duplex); `authority` is the `:authority`
-/// of every call (`host:port`). The scheme is the client's (`http` or `https`).
+/// of every call (`host:port`). When the connection ends the channel's calls fail `UNAVAILABLE`: for a channel that connects
+/// again by itself use `dial_channel`.
 pub fn channel(c: h2.Client, authority: str) -> Channel {
-    Channel(c, authority.bytes(), c.scheme.copy(), "eider-grpc/0.7".bytes(), 4194304)
+    Channel(sync.lock(c), None, authority.bytes(), "eider-grpc/0.7".bytes(), 4194304, Retry(1, 100, 2000))
+}
+
+/// A channel that makes its connection with `dial` (called now, and again whenever the connection has ended: a call finds
+/// a dead connection and dials a new one before it starts), so a server that restarts or a connection that breaks costs a call at
+/// most a retry (`with_retry`), not the channel.
+pub fn dial_channel(dial: fn() -> Result[h2.Client, String], authority: str) -> Result[Channel, def.Status] uses io, clock {
+    match dial() {
+        Ok(c) => { Ok(Channel(sync.lock(c), Some(dial), authority.bytes(), "eider-grpc/0.7".bytes(), 4194304, Retry(1, 100, 2000))) }
+        Err(why) => Err(def.status_text(def.UNAVAILABLE, why))
+    }
+}
+
+/// Another handle to the same connection (a Client holds locks and tasks, which `.copy()` refuses to duplicate: it is rebuilt from its parts).
+fn share(c: h2.Client) -> h2.Client { h2.Client(c.conn, c.tasks, c.scheme, c.authority) }
+
+impl Channel {
+    /// Unary calls that fail `UNAVAILABLE` are retried: `max_attempts` in all, `initial` before the second, doubling up to `max`.
+    fn with_retry(self, max_attempts: i32, initial: time.Duration, max: time.Duration) -> Channel {
+        Channel(self.cur, self.dial, self.authority.copy(), self.user_agent.copy(), self.max_recv, Retry(max_attempts, initial.ns / 1000000, max.ns / 1000000))
+    }
+
+    /// The largest response message accepted (4 MiB by default).
+    fn with_max_recv(self, n: usize) -> Channel {
+        Channel(self.cur, self.dial, self.authority.copy(), self.user_agent.copy(), n, self.retry)
+    }
+
+    /// The connection to use now: the current one, or (for a channel made with `dial_channel`) a new one when it has ended.
+    fn connection(self) -> Result[h2.Client, def.Status] uses io, clock {
+        let d = self.dial
+        self.cur.modify(|inout c: h2.Client| -> Result[h2.Client, def.Status] {
+            if c.failure().is_none() { return Ok(share(c)) }
+            match d {
+                Some(f) => {
+                    match f() {
+                        Ok(n) => {
+                            c.close()
+                            c = share(n)
+                            Ok(n)
+                        }
+                        Err(why) => Err(def.status_text(def.UNAVAILABLE, why))
+                    }
+                }
+                None => Ok(share(c))
+            }
+        })
+    }
+
+    /// Closes the connection.
+    fn close(self) uses io, clock {
+        let c = self.cur.get()
+        c.close()
+    }
+}
+
+/// A background task that pings the channel's connection every `interval` and closes it when a ping is not answered within `timeout`, so
+/// the next call finds it dead (and a `dial_channel` channel connects again) instead of waiting on a connection that is gone.
+pub type Keepalive = { stop: sync.Lock[bool], task: Task[i32] }
+
+impl Keepalive {
+    /// Stops the task (it ends within 100 ms).
+    fn stop(self) uses io, clock {
+        self.stop.modify(|inout s: bool| -> () { s = true })
+        let z = self.task.join()
+    }
+}
+
+/// Starts the keepalive of `ch`.
+pub fn keepalive(ch: Channel, interval: time.Duration, timeout: time.Duration) -> Keepalive uses io, clock, threads {
+    let stop = sync.lock(false)
+    let task = spawn(|| -> i32 {
+        let mut waited: i64 = 0
+        let step: i64 = 100
+        while !stop.get() {
+            time.sleep_ms(step)
+            waited += step
+            if waited * 1000000 >= interval.ns {
+                waited = 0
+                match ch.connection() {
+                    Ok(c) => {
+                        match c.ping(time.after(timeout)) {
+                            Ok(rtt) => {}
+                            Err(e) => { c.close() }
+                        }
+                    }
+                    Err(st) => {}
+                }
+            }
+        }
+        0
+    })
+    Keepalive(stop, task)
 }
 
 /// Per-call settings: the timeout (sent as `grpc-timeout`, and the client gives up at it: `DEADLINE_EXCEEDED`) and the request
 /// metadata (`-bin` keys carry bytes).
-pub type CallOpts = { timeout: Option[time.Duration], metadata: List[http.Header] }
+pub type CallOpts = { timeout: Option[time.Duration], metadata: List[http.Header], compress: bool }
 
-pub fn call_opts() -> CallOpts { CallOpts(None, List.new()) }
+pub fn call_opts() -> CallOpts { CallOpts(None, List.new(), false) }
 
 impl CallOpts {
-    fn with_timeout(self, d: time.Duration) -> CallOpts { CallOpts(Some(d), self.metadata.copy()) }
+    fn with_timeout(self, d: time.Duration) -> CallOpts { CallOpts(Some(d), self.metadata.copy(), self.compress) }
+
+    /// Compress the request messages with gzip (`grpc-encoding: gzip`); the server's responses are decoded whatever they use.
+    fn with_compression(self) -> CallOpts { CallOpts(self.timeout, self.metadata.copy(), true) }
 
     fn with_metadata(self, key: str, value: List[u8]) -> CallOpts {
         let mut m = self.metadata.copy()
         m.push(http.Header(key.bytes(), value))
-        CallOpts(self.timeout, m)
+        CallOpts(self.timeout, m, self.compress)
     }
 }
 
 /// A call in progress, as bytes. What a response head and trailers say about the status is read once and kept.
-type Raw = { st: h2.Stream, rd: sync.Lock[Reader], dl: time.Deadline, state: sync.Lock[Seen] }
+type Raw = { st: h2.Stream, rd: sync.Lock[Reader], dl: time.Deadline, state: sync.Lock[Seen], gz: bool }
 
 type Seen = { head: bool, final: Option[def.Status], head_md: List[http.Header], trailer_md: List[http.Header] }
 
@@ -450,13 +595,15 @@ fn start(ch: Channel, method: str, o: CallOpts) -> Result[Raw, def.Status] uses 
     let mut dl = time.never()
     let mut hs: List[http.Header] = List.new()
     hs.push(http.Header(":method".bytes(), "POST".bytes()))
-    hs.push(http.Header(":scheme".bytes(), ch.scheme.copy()))
+    let conn = ch.connection()?
+    hs.push(http.Header(":scheme".bytes(), conn.scheme.copy()))
     hs.push(http.Header(":path".bytes(), method.bytes()))
     hs.push(http.Header(":authority".bytes(), ch.authority.copy()))
     hs.push(http.Header("content-type".bytes(), content_type()))
     hs.push(http.Header("te".bytes(), "trailers".bytes()))
     hs.push(http.Header("user-agent".bytes(), ch.user_agent.copy()))
-    hs.push(http.Header("grpc-accept-encoding".bytes(), "identity".bytes()))
+    hs.push(http.Header("grpc-accept-encoding".bytes(), "gzip,identity".bytes()))
+    if o.compress { hs.push(http.Header("grpc-encoding".bytes(), "gzip".bytes())) }
     match o.timeout {
         Some(d) => {
             dl = time.after(d)
@@ -465,10 +612,10 @@ fn start(ch: Channel, method: str, o: CallOpts) -> Result[Raw, def.Status] uses 
         None => {}
     }
     for f in metadata_fields(o.metadata) { hs.push(f) }
-    match ch.c.open(hs, false, dl) {
+    match conn.open(hs, false, dl) {
         Ok(st) => {
-            let rd = sync.lock(Reader(st, List.new(), ch.max_recv, false))
-            Ok(Raw(st, rd, dl, sync.lock(Seen(false, None, List.new(), List.new()))))
+            let rd = sync.lock(Reader(st, List.new(), ch.max_recv, false, false))
+            Ok(Raw(st, rd, dl, sync.lock(Seen(false, None, List.new(), List.new())), o.compress))
         }
         Err(e) => Err(from_h2(e))
     }
@@ -498,7 +645,7 @@ fn status_in(hs: List[http.Header]) -> Option[def.Status] {
 
 impl Raw {
     fn send(self, msg: List[u8]) -> Result[(), def.Status] uses io, clock {
-        match self.st.send(frame(msg), false, self.dl) {
+        match self.st.send(frame_with(msg, self.gz), false, self.dl) {
             Ok(z) => Ok(())
             Err(e) => Err(from_h2(e))
         }
@@ -539,6 +686,12 @@ impl Raw {
                 s.final = Some(st)
             })
             return Ok(())
+        }
+        match http.find_s(hs, "grpc-encoding") {
+            Some(enc) => {
+                if http.eq_s(enc, "gzip") { self.rd.modify(|inout r: Reader| -> () { r.gz = true }) }
+            }
+            None => {}
         }
         self.state.modify(|inout s: Seen| -> () {
             s.head = true
@@ -663,12 +816,40 @@ fn open_call[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R],
     Ok(Call(raw, qc, rc))
 }
 
-/// A unary call: `method` is `/pkg.Service/Method`.
-pub fn unary[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], req: Q, o: CallOpts) -> Result[R, def.Status] uses io, clock {
+fn unary_once[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], req: Q, o: CallOpts) -> Result[R, def.Status] uses io, clock {
     let call = open_call(ch, method, qc, rc, o)?
     let r = unary_on(call, req)
     call.done()
     r
+}
+
+/// A unary call: `method` is `/pkg.Service/Method`. A channel with a retry policy (`Channel.with_retry`) repeats it after `UNAVAILABLE`.
+pub fn unary[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], req: Q, o: CallOpts) -> Result[R, def.Status] uses io, clock {
+    let t0 = time.mono_ns()
+    let mut attempt: i32 = 1
+    let mut wait = ch.retry.initial_ms
+    while true {
+        // each attempt gets what is left of the call's timeout
+        let mut oo = o.copy()
+        match o.timeout {
+            Some(d) => {
+                let left = d.ns - (time.mono_ns() - t0)
+                if left <= 0 { return Err(def.status(def.DEADLINE_EXCEEDED, "the deadline passed")) }
+                oo = o.with_timeout(time.nanos(left))
+            }
+            None => {}
+        }
+        match unary_once(ch, method, qc, rc, req, oo) {
+            Ok(r) => { return Ok(r) }
+            Err(st) => {
+                if st.code != def.UNAVAILABLE || attempt >= ch.retry.max_attempts { return Err(st) }
+                time.sleep_ms(wait)
+                wait = if wait * 2 > ch.retry.max_ms { ch.retry.max_ms } else { wait * 2 }
+                attempt += 1
+            }
+        }
+    }
+    Err(def.status(def.INTERNAL, "unreachable"))
 }
 
 fn unary_on[Q, R](call: Call[Q, R], req: Q) -> Result[R, def.Status] uses io, clock {

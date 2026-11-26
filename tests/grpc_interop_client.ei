@@ -139,6 +139,11 @@ fn main() uses net, io, clock, threads {
         Err(st) => { bad += check("1 MiB message", false) }
     }
 
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello(bigs.copy()), o.with_compression()) {
+        Ok(r) => { bad += check("gzip request", r.message.len() == 1048576 + 7) }
+        Err(st) => { bad += check("gzip request", false) }
+    }
+
     let mut tasks: List[Task[i32]] = List.new()
     for i in 0..30 {
         let cc2 = ch

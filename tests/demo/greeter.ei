@@ -23,6 +23,7 @@ pub fn service() -> def.Service uses clock {
     let nc = def.codec[pb.Num](reg, "demo.Num")
     def.service("demo.Greeter")
         .unary("SayHello", hq, hr, |c: def.Ctx, q: pb.HelloRequest| -> Result[pb.HelloReply, def.Status] {
+            if c.get("x-compress").is_some() { c.set_compression(true) }
             Ok(blank(cat("Hello, ", q.name.copy())))
         })
         .unary("Fail", hq, hr, |c: def.Ctx, q: pb.HelloRequest| -> Result[pb.HelloReply, def.Status] {

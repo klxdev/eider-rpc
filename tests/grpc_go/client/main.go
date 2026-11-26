@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -137,6 +138,11 @@ func main() {
 	big := strings.Repeat("x", 1<<20)
 	out, err = call(ctx, "SayHello", common.Str(big))
 	check("1 MiB message", err == nil && common.GetStr(out) == "Hello, "+big)
+
+	// gzip: a compressed request, and the Eider handler compresses the response (x-compress asks for it)
+	gctx := metadata.AppendToOutgoingContext(ctx, "x-compress", "1")
+	out, err = call(gctx, "SayHello", common.Str(big), grpc.UseCompressor(gzip.Name))
+	check("gzip request and response", err == nil && common.GetStr(out) == "Hello, "+big)
 
 	// 30 at once on one connection
 	var wg sync.WaitGroup

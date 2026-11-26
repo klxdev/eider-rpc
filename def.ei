@@ -81,7 +81,7 @@ impl Show for Status {
 
 // ---- the call's context ----
 
-type CtxOut = { header: List[http.Header], trailer: List[http.Header] }
+type CtxOut = { header: List[http.Header], trailer: List[http.Header], compress: bool }
 
 /// What a handler knows about the call and can say about it. `metadata` is the request's (lowercase keys; `-bin` keys
 /// hold the decoded bytes), `deadline` when the caller gave up (never: no timeout), `peer` the caller's address
@@ -89,7 +89,7 @@ type CtxOut = { header: List[http.Header], trailer: List[http.Header] }
 pub type Ctx = { method: String, metadata: List[http.Header], deadline: time.Deadline, peer: String, out: sync.Lock[CtxOut] }
 
 pub fn ctx(method: String, metadata: List[http.Header], deadline: time.Deadline, peer: String) -> Ctx {
-    Ctx(method, metadata, deadline, peer, sync.lock(CtxOut(List.new(), List.new())))
+    Ctx(method, metadata, deadline, peer, sync.lock(CtxOut(List.new(), List.new(), false)))
 }
 
 impl Ctx {
@@ -107,6 +107,11 @@ impl Ctx {
         let k = key.bytes()
         self.out.modify(|inout o: CtxOut| -> () { o.trailer.push(http.Header(k, value)) })
     }
+
+    /// Compress the response messages with gzip (gRPC only; used when the caller accepts it; set it before the first message is sent).
+    fn set_compression(self, on: bool) { self.out.modify(|inout o: CtxOut| -> () { o.compress = on }) }
+
+    fn compression(self) -> bool { self.out.modify(|inout o: CtxOut| -> bool { o.compress }) }
 
     fn headers_out(self) -> List[http.Header] { self.out.modify(|inout o: CtxOut| -> List[http.Header] { o.header.copy() }) }
 

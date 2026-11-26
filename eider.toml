@@ -23,3 +23,9 @@ version = "0.7.0"
 [deps.proto]
 git = "https://github.com/klxdev/eider-proto.git"
 version = "0.7.0"
+
+# gzip for compressed gRPC messages (rpc/grpc); granted what eider-http grants it (eider-pkg grants per package)
+[deps.compression]
+git = "https://github.com/klxdev/eider-compression.git"
+version = "0.7.0"
+uses = ["io", "clock"]

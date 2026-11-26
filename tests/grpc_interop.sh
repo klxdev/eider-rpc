@@ -90,12 +90,12 @@ fi
 if command -v go >/dev/null 2>&1; then
   if (cd "$here/tests/grpc_go" && go build -o "$T/goclient" ./client && go build -o "$T/goserver" ./server) > "$T/go.log" 2>&1; then
     timeout 120 "$T/goclient" "$port" > "$T/o" 2>&1; echo "exit $?" >> "$T/o"
-    check "Go client (grpc-go) against the Eider server" "$T/o" "ok   unary SayHello" "ok   error status NOT_FOUND" "ok   metadata in" "ok   deadline: DEADLINE_EXCEEDED" "ok   server streaming Count" "ok   client streaming Sum" "ok   bidirectional Chat" "ok   cancelled call is CANCELLED" "ok   1 MiB message" "ok   30 concurrent calls" "exit 0"
+    check "Go client (grpc-go) against the Eider server" "$T/o" "ok   unary SayHello" "ok   error status NOT_FOUND" "ok   metadata in" "ok   deadline: DEADLINE_EXCEEDED" "ok   server streaming Count" "ok   client streaming Sum" "ok   bidirectional Chat" "ok   cancelled call is CANCELLED" "ok   1 MiB message" "ok   gzip" "ok   30 concurrent calls" "exit 0"
     "$T/goserver" > "$T/gs.log" 2>&1 &
     wait_for "$T/gs.log" listening
     gport=$(sed -n 's/^listening //p' "$T/gs.log" | head -1)
     timeout 120 "$bin/grpccli" "$gport" > "$T/o" 2>&1; echo "exit $?" >> "$T/o"
-    check "Eider client against a Go server (grpc-go)" "$T/o" "ok   unary SayHello" "ok   error status NOT_FOUND" "ok   metadata in" "ok   deadline: DEADLINE_EXCEEDED" "ok   server streaming Count" "ok   client streaming Sum" "ok   bidirectional Chat" "ok   cancelled call is CANCELLED" "ok   1 MiB message" "ok   30 concurrent calls" "exit 0"
+    check "Eider client against a Go server (grpc-go)" "$T/o" "ok   unary SayHello" "ok   error status NOT_FOUND" "ok   metadata in" "ok   deadline: DEADLINE_EXCEEDED" "ok   server streaming Count" "ok   client streaming Sum" "ok   bidirectional Chat" "ok   cancelled call is CANCELLED" "ok   1 MiB message" "ok   gzip" "ok   30 concurrent calls" "exit 0"
   else
     echo "FAIL grpc interop: go build of tests/grpc_go"; tail -20 "$T/go.log"; fail=1
   fi

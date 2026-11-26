@@ -1,0 +1,167 @@
+// A channel that reconnects, retries unary calls that fail UNAVAILABLE, and a keepalive that notices a connection that has gone silent.
+
+import core.sys
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.sync
+import std.task
+import std.time
+import http
+import proto
+import http.h2
+import http.transport
+import rpc.def
+import rpc.grpc
+import rpc.tests.demo.demo as pb
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn cat(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn show(st: def.Status) -> String {
+    let mut l = def.code_name(st.code)
+    l.push_str(" ")
+    l.append(st.message.copy())
+    l
+}
+
+/// A service whose Try fails UNAVAILABLE until it has been called `after` times.
+fn flaky(reg: proto.Registry, after: i64, calls: sync.Lock[i64]) -> def.Service {
+    let nc = def.codec[pb.Num](reg, "demo.Num")
+    def.service("demo.Flaky").unary("Try", nc, nc, |c: def.Ctx, q: pb.Num| -> Result[pb.Num, def.Status] {
+        let n = calls.modify(|inout k: i64| -> i64 {
+            k += 1
+            k
+        })
+        if n <= after { return Err(def.status(def.UNAVAILABLE, "not ready")) }
+        Ok(pb.Num(n, empty()))
+    })
+}
+
+fn main() uses net, io, clock, threads {
+    let reg = pb.registry()
+    let hq = def.codec[pb.HelloRequest](reg, "demo.HelloRequest")
+    let hr = def.codec[pb.HelloReply](reg, "demo.HelloReply")
+    let nc = def.codec[pb.Num](reg, "demo.Num")
+    let calls = sync.lock(0 as i64)
+    let svcs = List[greeter.service(), flaky(reg, 2, calls)]
+    let dials = sync.lock(0 as i32)
+    let servers: sync.Lock[List[Task[i32]]] = sync.lock(List.new())
+
+    // each dial makes a new connection to a new server task
+    let dial = || -> Result[h2.Client, String] {
+        let p = net.pair(net.STREAM).unwrap()
+        let z1 = fd.set_nonblocking(p.r, true)
+        let z2 = fd.set_nonblocking(p.w, true)
+        let sw = h2.wire_of_transport(transport.plain(p.w))
+        let t = spawn(|| -> i32 {
+            let z = h2.serve(sw, h2.options(), grpc.handler(svcs))
+            0
+        })
+        servers.modify(|inout l: List[Task[i32]]| -> () { l.push(t) })
+        dials.modify(|inout n: i32| -> () { n += 1 })
+        match h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()) {
+            Ok(c) => Ok(c)
+            Err(e) => Err(e.why)
+        }
+    }
+    let ch = grpc.dial_channel(dial, "t").unwrap()
+    let o = grpc.call_opts()
+
+    say(String.from("-- a call, then the connection ends, then another call"))
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, pb.HelloRequest(String.from("one"), empty()), o) {
+        Ok(r) => { say(r.message.copy()) }
+        Err(st) => { say(show(st)) }
+    }
+    say(cat("dials: ", dials.get().to_string()))
+    ch.cur.get().close()
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, pb.HelloRequest(String.from("two"), empty()), o) {
+        Ok(r) => { say(r.message.copy()) }
+        Err(st) => { say(show(st)) }
+    }
+    say(cat("dials: ", dials.get().to_string()))
+
+    say(String.from("-- UNAVAILABLE without a retry policy is returned"))
+    match grpc.unary(ch, "/demo.Flaky/Try", nc, nc, pb.Num(0, empty()), o) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+    say(String.from("-- with 3 attempts the third call succeeds (the first call above was the first failure)"))
+    let rch = ch.with_retry(3, time.millis(10), time.millis(100))
+    match grpc.unary(rch, "/demo.Flaky/Try", nc, nc, pb.Num(0, empty()), o) {
+        Ok(r) => { say(cat("succeeded on call ", r.n.to_string())) }
+        Err(st) => { say(show(st)) }
+    }
+    say(String.from("-- an error that is not UNAVAILABLE is not retried"))
+    match grpc.unary(rch, "/demo.Greeter/Fail", hq, hr, pb.HelloRequest(String.from("x"), empty()), o) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+    say(String.from("-- retries stop at the call's own deadline"))
+    let always = sync.lock(0 as i64)
+    let svc2 = flaky(reg, 1000000, always)
+    let dial2 = || -> Result[h2.Client, String] {
+        let p = net.pair(net.STREAM).unwrap()
+        let z1 = fd.set_nonblocking(p.r, true)
+        let z2 = fd.set_nonblocking(p.w, true)
+        let sw = h2.wire_of_transport(transport.plain(p.w))
+        let t = spawn(|| -> i32 {
+            let z = h2.serve(sw, h2.options(), grpc.handler(List[svc2]))
+            0
+        })
+        servers.modify(|inout l: List[Task[i32]]| -> () { l.push(t) })
+        match h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()) {
+            Ok(c) => Ok(c)
+            Err(e) => Err(e.why)
+        }
+    }
+    let dch = grpc.dial_channel(dial2, "t").unwrap().with_retry(50, time.millis(100), time.millis(100))
+    let t0 = time.mono_ms()
+    match grpc.unary(dch, "/demo.Flaky/Try", nc, nc, pb.Num(0, empty()), o.with_timeout(time.millis(450))) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+    let took = time.mono_ms() - t0
+    say(String.from(if took >= 400 && took < 1500 { "stopped near the deadline" } else { "WRONG TIME" }))
+    dch.close()
+
+    say(String.from("-- keepalive: a peer that reads and never answers is noticed, and the channel is marked dead"))
+    let p3 = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p3.r, true)
+    let z2 = fd.set_nonblocking(p3.w, true)
+    let hole = spawn(|| -> i32 {
+        // reads everything, says nothing
+        let t = transport.plain(p3.w)
+        let end = time.after(time.seconds(6))
+        while !end.expired() {
+            match t.read_by(65536, time.after_ms(100)) {
+                Ok(Some(b)) => { if b.len() == 0 { break } }
+                Ok(None) => {}
+                Err(e) => { break }
+            }
+        }
+        t.close_now()
+        0
+    })
+    let dead = h2.connect(h2.wire_of_transport(transport.plain(p3.r)), h2.options()).unwrap()
+    let kch = grpc.channel(dead, "t")
+    let ka = grpc.keepalive(kch, time.millis(200), time.millis(300))
+    time.sleep_ms(1500)
+    say(String.from(if kch.cur.get().failure().is_some() { "the silent connection was closed" } else { "STILL OPEN" }))
+    ka.stop()
+    let zh = hole.join()
+
+    ch.close()
+    let all = servers.get()
+    for t in all { let zj = t.join() }
+    say(String.from("done"))
+}

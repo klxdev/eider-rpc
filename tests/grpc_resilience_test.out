@@ -1,0 +1,17 @@
+-- a call, then the connection ends, then another call
+Hello, one
+dials: 1
+Hello, two
+dials: 2
+-- UNAVAILABLE without a retry policy is returned
+UNAVAILABLE not ready
+-- with 3 attempts the third call succeeds (the first call above was the first failure)
+succeeded on call 3
+-- an error that is not UNAVAILABLE is not retried
+NOT_FOUND no such user: x
+-- retries stop at the call's own deadline
+DEADLINE_EXCEEDED the deadline passed
+stopped near the deadline
+-- keepalive: a peer that reads and never answers is noticed, and the channel is marked dead
+the silent connection was closed
+done

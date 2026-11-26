@@ -170,6 +170,15 @@ fn main() uses net, io, clock, threads {
     }
     cn.done()
 
+    say(String.from("-- gzip: a compressed request and a compressed response (the handler asks for it; the caller accepts it)"))
+    let zo = o.with_compression().with_metadata("x-compress", "1".bytes())
+    let big = String.from("abcdefghij")
+    let mut text = String.from("")
+    for i in 0..5000 { text.append(big.copy()) }
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, pb.HelloRequest(text.copy(), empty()), zo) {
+        Ok(r) => { say(cat("compressed round trip, reply bytes: ", r.message.len().to_string())) }
+        Err(st) => { say(show(st)) }
+    }
     say(String.from("-- the connection is still good after all that"))
     match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello("again"), o) {
         Ok(r) => { say(r.message.copy()) }

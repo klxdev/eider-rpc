@@ -1,60 +1,78 @@
 -- a unary call: head, one framed message, trailers with grpc-status 0
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity 
   body: 000000000e0a0c48656c6c6f2c20776f726c64
   trailers: grpc-status=0 
 -- an error status: the grpc-message is percent-encoded, custom trailers follow
 > /demo.Greeter/Fail
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=5 grpc-message=no such user: %C3%A9%C3%A8%C3%B1 x-failed=yes 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=5 grpc-message=no such user: %C3%A9%C3%A8%C3%B1 x-failed=yes 
   body: 
   trailers: none
 -- an unknown method: a trailers-only response (the head carries the status, END_STREAM)
 > /demo.Greeter/Nope
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=12 grpc-message=unknown service or method 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=12 grpc-message=unknown service or method 
   body: 
   trailers: none
 -- the grpc-timeout is read: 5 seconds is plenty
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity 
   body: 000000000e0a0c48656c6c6f2c20776f726c64
   trailers: grpc-status=0 
 -- a bad grpc-timeout is INTERNAL
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=13 grpc-message=a bad grpc-timeout 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=13 grpc-message=a bad grpc-timeout 
+  body: 
+  trailers: none
+-- a compressed message (flag 1) without a grpc-encoding is INTERNAL
+> /demo.Greeter/SayHello
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=13 grpc-message=a compressed message without a grpc-encoding that says how 
+  body: 
+  trailers: none
+-- a gzip message with grpc-encoding: gzip is served, and the response is not compressed unless asked
+> /demo.Greeter/SayHello
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity 
+  body: 000000000e0a0c48656c6c6f2c20776f726c64
+  trailers: grpc-status=0 
+-- a flag-1 message that is not gzip is INTERNAL
+> /demo.Greeter/SayHello
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=13 grpc-message=a compressed message is not valid gzip 
+  body: 
+  trailers: none
+-- the handler asks for compression and the caller accepts gzip: grpc-encoding: gzip, flag 1
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-encoding=gzip 
+  flag byte: 1
+-- a gzip bomb (1 GiB of zeros in a few KiB) is RESOURCE_EXHAUSTED
+> /demo.Greeter/SayHello
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=8 grpc-message=a compressed message expands past the receive limit 
   body: 
   trailers: none
 -- an unsupported grpc-encoding is UNIMPLEMENTED
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=12 grpc-message=unsupported grpc-encoding (identity only) 
-  body: 
-  trailers: none
--- a compressed message (flag 1) is UNIMPLEMENTED
-> /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=12 grpc-message=compressed messages are not supported (grpc-encoding: identity) 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=12 grpc-message=unsupported grpc-encoding (gzip and identity) 
   body: 
   trailers: none
 -- a message that is cut short ends the call as INTERNAL
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=13 grpc-message=the stream ended inside a message 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=13 grpc-message=the stream ended inside a message 
   body: 
   trailers: none
 -- an empty request body for a unary method is INVALID_ARGUMENT
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=3 grpc-message=the request has no message 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=3 grpc-message=the request has no message 
   body: 
   trailers: none
 -- two request messages for a unary method are INVALID_ARGUMENT
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=3 grpc-message=a unary request has one message 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=3 grpc-message=a unary request has one message 
   body: 
   trailers: none
 -- a message over the 4 MiB limit is RESOURCE_EXHAUSTED (the length prefix alone says so)
 > /demo.Greeter/SayHello
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity grpc-status=8 grpc-message=a message is larger than the receive limit 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity grpc-status=8 grpc-message=a message is larger than the receive limit 
   body: 
   trailers: none
 -- a stream that is not gRPC gets 415
   head: :status=415 
 -- the content type may carry +proto
-  head: :status=200 content-type=application/grpc grpc-accept-encoding=identity 
+  head: :status=200 content-type=application/grpc grpc-accept-encoding=gzip,identity 
 done
