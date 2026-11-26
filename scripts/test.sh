@@ -9,7 +9,7 @@
 # built once under ThreadSanitizer and run once each, when $CC can build a TSan program
 # (else `skip`). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN="examples/kvstore/tests/e2e_test.ei tests/service_test.ei tests/grpc_test.ei tests/grpc_wire_test.ei tests/grpc_upgrade_test.ei tests/stubs_test.ei tests/control_test.ei tests/grpc_resilience_test.ei tests/connect_stream_test.ei"
+TSAN="examples/kvstore/tests/e2e_test.ei tests/service_test.ei tests/grpc_test.ei tests/grpc_wire_test.ei tests/grpc_upgrade_test.ei tests/stubs_test.ei tests/control_test.ei tests/grpc_resilience_test.ei tests/connect_stream_test.ei tests/reflection_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?

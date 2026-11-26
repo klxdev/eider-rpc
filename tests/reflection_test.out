@@ -1,0 +1,22 @@
+-- v1
+services: demo.Greeter grpc.reflection.v1.ServerReflection grpc.reflection.v1alpha.ServerReflection
+files: demo.proto
+files: demo.proto
+files: demo.proto
+files: demo.proto
+error 5: symbol not found
+error 5: file not found
+extension numbers
+files: grpc/reflection/v1/reflection.proto
+ended ok
+-- v1alpha
+services: demo.Greeter grpc.reflection.v1.ServerReflection grpc.reflection.v1alpha.ServerReflection
+files: demo.proto
+files: demo.proto
+files: demo.proto
+files: demo.proto
+error 5: symbol not found
+error 5: file not found
+extension numbers
+files: grpc/reflection/v1/reflection.proto
+done

@@ -17,12 +17,18 @@ import http.server
 import http.secure
 import rpc.connect
 import rpc.grpc
+import proto
+import rpc.reflection
+import rpc.tests.demo.demo as pb
 import rpc.tests.demo.greeter as greeter
 
 fn main() uses io, net, clock, threads, fs {
     let a = env.args()
     let tok = task.root()
-    let svcs = List[greeter.service()]
+    // the services, and server reflection describing them
+    let mut descs: List[proto.FileDesc] = List.new()
+    pb.add_descs(inout descs)
+    let svcs = reflection.with(descs, List[greeter.service()])
     let mut r = router.new()
     let t2 = tok
     r.get("/quit", |q: http.Request| -> http.Response {

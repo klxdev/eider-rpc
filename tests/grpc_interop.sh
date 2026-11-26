@@ -60,6 +60,16 @@ if [ -n "$GRPCURL" ] && [ -x "$GRPCURL" ]; then
   check "grpcurl: error status" "$T/o" "Code: NotFound" "Message: no such user: zed"
   $GRPCURL -plaintext -import-path "$D" -proto demo.proto -H 'x-token: tok1' -H 'x-raw-bin: AAECAw==' -d '{"name":"m"}' -v 127.0.0.1:$port demo.Greeter/Meta > "$T/o" 2>&1
   check "grpcurl: metadata, headers and trailers" "$T/o" "token=tok1 raw=4" "x-seen: tok1" "x-done: 1"
+  $GRPCURL -plaintext 127.0.0.1:$port list > "$T/o" 2>&1
+  check "grpcurl: server reflection lists the services (no .proto files)" "$T/o" "demo.Greeter" "grpc.reflection.v1.ServerReflection"
+  $GRPCURL -plaintext 127.0.0.1:$port describe demo.Greeter > "$T/o" 2>&1
+  check "grpcurl: describe a service through reflection" "$T/o" "rpc SayHello" "rpc Count" "stream" "rpc Chat"
+  $GRPCURL -plaintext 127.0.0.1:$port describe demo.HelloRequest > "$T/o" 2>&1
+  check "grpcurl: describe a message through reflection" "$T/o" "string name = 1"
+  $GRPCURL -plaintext -d '{"name":"reflected"}' 127.0.0.1:$port demo.Greeter/SayHello > "$T/o" 2>&1
+  check "grpcurl: a call with no -proto, types from reflection" "$T/o" "Hello, reflected"
+  $GRPCURL -plaintext -d '{"name":"a"} {"name":"b"}' 127.0.0.1:$port demo.Greeter/Chat > "$T/o" 2>&1
+  check "grpcurl: a bidirectional call through reflection" "$T/o" "echo: a" "echo: b"
   if [ -f "$PKI/root.pem" ]; then
     $GRPCURL -cacert "$PKI/root.pem" -authority localhost -import-path "$D" -proto demo.proto -d '{"name":"tls"}' 127.0.0.1:$tport demo.Greeter/SayHello > "$T/o" 2>&1
     check "grpcurl over TLS (ALPN h2)" "$T/o" "Hello, tls"

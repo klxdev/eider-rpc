@@ -65,12 +65,22 @@ With the generated client: `ctlg.control_client(ch, reg).info(req, opts)`; serve
 
 `connect.handler(services)` serves unary calls (`application/json`, `application/proto`) over any HTTP version and server-streaming methods (`application/connect+json` / `+proto`: one request envelope in, envelopes out, then an end-stream envelope carrying the error and trailing metadata) over HTTP/1.1. `connect.middleware(services)` (for `server.Config.h2_wrap`, next to `grpc.middleware`) serves all four kinds, bidirectional included, over HTTP/2. Envelope compression is not supported; the JSON of a message leaves out the `unknown_fields` bookkeeping member.
 
+## Server reflection
+
+`reflection.with(descs, services)` returns `services` plus `grpc.reflection.v1.ServerReflection` and `v1alpha` (the same messages), so grpcurl, grpc_cli and Postman can list, describe and call the services without the `.proto` files. `descs` are the descriptors of the generated modules (`mod.add_descs(inout list)`, which adds a module's own file and its imports': eider-proto's `proto/descriptor` builds the `FileDescriptorProto`, and for the BuildKit control files it is identical to protoc's, `tests/descriptors.sh` in eider-proto). Supported: `list_services`, `file_by_filename`, `file_containing_symbol` (service, method, message, enum), each with the file's imports; extension requests get an empty list or `NOT_FOUND`.
+
+```eider
+let mut descs: List[proto.FileDesc] = List.new()
+pb.add_descs(inout descs)
+let services = reflection.with(descs, List[greeter_service])
+```
+
 ## Docker's BuildKit endpoints
 
 `/grpc` and `/session` upgrade an HTTP/1.1 request (`Connection: Upgrade`, `Upgrade: h2c`) and then speak HTTP/2 on the hijacked connection, with the roles reversed on `/session`: the daemon is the **gRPC server** on `/grpc` (`h2.accept_server(req, opts, grpc.handler(services))`) and the gRPC **client** on `/session` (`h2.accept_client(req, opts, |c| { let ch = grpc.channel(c, "..."); ... })`), calling the Docker CLI, which serves file sync, auth and secrets over the connection it made. `tests/grpc_upgrade_test.ei` plays both, and `tests/control_test.ei` serves BuildKit's real Control service (its generated messages and stubs) and calls it.
 
 ## Tests
 
-Eider only: `tests/grpc_test` (all four kinds, statuses and trailers, metadata, deadlines, cancellation, Connect and JSON-RPC from the same service), `tests/grpc_wire_test` (raw HTTP/2 requests and the exact bytes, heads and trailers back), `tests/grpc_upgrade_test`, `tests/stubs_test`, `tests/control_test`, `tests/grpc_resilience_test` (reconnect, retry, keepalive), `tests/connect_stream_test` (Connect streaming by hand). Optional (`tests/grpc_interop.sh`; `skip` without the tool): grpcurl (plain and TLS), a Go client and a Go server (grpc-go, `tests/grpc_go`), curl for Connect.
+Eider only: `tests/grpc_test` (all four kinds, statuses and trailers, metadata, deadlines, cancellation, Connect and JSON-RPC from the same service), `tests/grpc_wire_test` (raw HTTP/2 requests and the exact bytes, heads and trailers back), `tests/grpc_upgrade_test`, `tests/stubs_test`, `tests/control_test`, `tests/grpc_resilience_test` (reconnect, retry, keepalive), `tests/connect_stream_test` (Connect streaming by hand), `tests/reflection_test`. Optional (`tests/grpc_interop.sh`; `skip` without the tool): grpcurl (plain and TLS), a Go client and a Go server (grpc-go, `tests/grpc_go`), curl for Connect.
 
-Not here: server reflection, load balancing and name resolution, the gRPC-Web and Connect GET variants, Connect envelope compression, zstd for gRPC.
+Not here: load balancing and name resolution, the gRPC-Web and Connect GET variants, Connect envelope compression, zstd for gRPC.

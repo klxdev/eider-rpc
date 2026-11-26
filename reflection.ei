@@ -1,0 +1,129 @@
+//! rpc/reflection: gRPC server reflection (`grpc.reflection.v1.ServerReflection`, and `v1alpha` for older tools): lets grpcurl,
+//! grpc_cli, Postman and the like list, describe and call a server's services without its `.proto` files.
+//!
+//!     let descs = reflection.descriptors_of(...)           // the FileDescs of the generated modules: `mod.add_descs(inout list)`
+//!     let all = List[greeter_service, reflection.service(descs, List[greeter_service])...]
+//!     grpc.handler(reflection.with(descs, services))       // services + reflection
+//!
+//! `proto/gen` writes each generated module's descriptor (`file_desc()`, `add_descs`), so reflection serves exactly the services and
+//! messages of the files they were generated from. Supported requests: `list_services`, `file_by_filename`, `file_containing_symbol`
+//! (a service, a method as `pkg.Service.Method`, a message, an enum), each answered with the file's descriptor and those of its imports
+//! (the file first); extension requests are answered with an empty list or `NOT_FOUND` (extensions are not used). A request for
+//! something unknown is an `ErrorResponse` with code `NOT_FOUND`, not a failed call.
+
+import std.bytes
+import std.serial
+import proto
+import rpc.def
+import rpc.reflection_pb as pb
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn find_file(descs: List[proto.FileDesc], name: String) -> Option[proto.FileDesc] {
+    for d in descs {
+        if d.name == name { return Some(d) }
+    }
+    None
+}
+
+fn file_defining(descs: List[proto.FileDesc], sym: String) -> Option[proto.FileDesc] {
+    for d in descs {
+        for s in d.symbols {
+            if s == sym { return Some(d) }
+        }
+    }
+    None
+}
+
+/// The file and, after it, everything it imports (each once).
+fn with_imports(descs: List[proto.FileDesc], first: proto.FileDesc) -> List[serial.Bytes] {
+    let mut seen: List[String] = List.new()
+    let mut out: List[serial.Bytes] = List.new()
+    let mut todo: List[proto.FileDesc] = List.new()
+    todo.push(first)
+    let mut i: usize = 0
+    while i < todo.len() {
+        let d = todo[i].copy()
+        i += 1
+        if seen.contains(d.name.copy()) { continue }
+        seen.push(d.name.copy())
+        out.push(serial.Bytes(d.data.copy()))
+        for dep in d.deps {
+            match find_file(descs, dep) {
+                Some(x) => { todo.push(x) }
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+fn error_response(code: i32, why: str) -> pb.ServerReflectionResponse_MessageResponse {
+    pb.ErrorResponseCase(pb.ErrorResponse(code, String.from(why), empty()))
+}
+
+fn answer(descs: List[proto.FileDesc], names: List[String], req: pb.ServerReflectionRequest) -> pb.ServerReflectionResponse {
+    let resp = match req.message_request {
+        None => { error_response(def.INVALID_ARGUMENT, "an empty reflection request") }
+        Some(r) => {
+            match r {
+                pb.ListServices(x) => {
+                    let mut l: List[pb.ServiceResponse] = List.new()
+                    for n in names { l.push(pb.ServiceResponse(n.copy(), empty())) }
+                    pb.ListServicesResponse(pb.ListServiceResponse(l, empty()))
+                }
+                pb.FileByFilename(f) => {
+                    match find_file(descs, f) {
+                        Some(d) => { pb.FileDescriptorResponseCase(pb.FileDescriptorResponse(with_imports(descs, d), empty())) }
+                        None => { error_response(def.NOT_FOUND, "file not found") }
+                    }
+                }
+                pb.FileContainingSymbol(sym) => {
+                    match file_defining(descs, sym) {
+                        Some(d) => { pb.FileDescriptorResponseCase(pb.FileDescriptorResponse(with_imports(descs, d), empty())) }
+                        None => { error_response(def.NOT_FOUND, "symbol not found") }
+                    }
+                }
+                pb.FileContainingExtension(x) => { error_response(def.NOT_FOUND, "extensions are not supported") }
+                pb.AllExtensionNumbersOfType(t) => {
+                    pb.AllExtensionNumbersResponse(pb.ExtensionNumberResponse(t, List.new(), empty()))
+                }
+            }
+        }
+    }
+    pb.ServerReflectionResponse(req.host.copy(), Some(req), Some(resp), empty())
+}
+
+fn one(reg: proto.Registry, name: String, descs: List[proto.FileDesc], names: List[String]) -> def.Service uses clock {
+    let rq = def.codec[pb.ServerReflectionRequest](reg, "grpc.reflection.v1.ServerReflectionRequest")
+    let rs = def.codec[pb.ServerReflectionResponse](reg, "grpc.reflection.v1.ServerReflectionResponse")
+    def.Service(name, List.new()).bidi("ServerReflectionInfo", rq, rs, |c: def.Ctx, inp: def.In[pb.ServerReflectionRequest], out: def.Out[pb.ServerReflectionResponse]| -> Result[(), def.Status] {
+        while true {
+            match inp.recv()? {
+                Some(r) => { out.send(answer(descs, names, r))? }
+                None => { break }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The reflection services (`grpc.reflection.v1.ServerReflection` and `grpc.reflection.v1alpha.ServerReflection`, which have the same messages) for
+/// `services`, describing them from `descs` (the descriptors of the generated modules, `add_descs`; the reflection service's own file is added).
+pub fn services(descs: List[proto.FileDesc], services: List[def.Service]) -> List[def.Service] uses clock {
+    let reg = pb.registry()
+    let mut all = descs.copy()
+    pb.add_descs(inout all)
+    let mut names: List[String] = List.new()
+    for s in services { names.push(s.name.copy()) }
+    names.push(String.from("grpc.reflection.v1.ServerReflection"))
+    names.push(String.from("grpc.reflection.v1alpha.ServerReflection"))
+    List[one(reg, String.from("grpc.reflection.v1.ServerReflection"), all.copy(), names.copy()), one(reg, String.from("grpc.reflection.v1alpha.ServerReflection"), all, names)]
+}
+
+/// `services` followed by their reflection services: what to give `grpc.handler` or `grpc.middleware`.
+pub fn with(descs: List[proto.FileDesc], svcs: List[def.Service]) -> List[def.Service] uses clock {
+    let mut out = svcs.copy()
+    for r in services(descs, svcs) { out.push(r) }
+    out
+}

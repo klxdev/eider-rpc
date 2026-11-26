@@ -1,0 +1,123 @@
+// gRPC server reflection (rpc/reflection) in Eider only: the reflection client side written with the generated messages, against a server that
+// serves demo.Greeter and the reflection service: list_services, file_by_filename, file_containing_symbol for a service, a method and a message,
+// and the answers for a symbol that does not exist and for extensions.
+
+import core.sys
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.task
+import std.time
+import http.h2
+import http.transport
+import proto
+import rpc.def
+import rpc.grpc
+import rpc.reflection
+import rpc.reflection_pb as rp
+import rpc.tests.demo.demo as pb
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn req(m: rp.ServerReflectionRequest_MessageRequest) -> rp.ServerReflectionRequest { rp.ServerReflectionRequest(String.from("h"), Some(m), empty()) }
+
+/// The `name` (field 1) of a serialized FileDescriptorProto.
+fn file_name(b: List[u8]) -> String {
+    if b.len() < 2 || b[0] != 10 { return String.from("?") }
+    let n = b[1] as usize
+    String.from_bytes(b.slice(2, 2 + n)).unwrap_or(String.from("?"))
+}
+
+fn show(r: rp.ServerReflectionResponse) -> String {
+    match r.message_response {
+        Some(m) => {
+            match m {
+                rp.ListServicesResponse(l) => {
+                    let mut s = String.from("services:")
+                    for x in l.service {
+                        s.push_str(" ")
+                        s.append(x.name.copy())
+                    }
+                    s
+                }
+                rp.FileDescriptorResponseCase(f) => {
+                    let mut s = String.from("files:")
+                    for d in f.file_descriptor_proto {
+                        s.push_str(" ")
+                        s.append(file_name(d.data.copy()))
+                    }
+                    s
+                }
+                rp.ErrorResponseCase(e) => {
+                    let mut s = String.from("error ")
+                    s.append(e.error_code.to_string())
+                    s.push_str(": ")
+                    s.append(e.error_message.copy())
+                    s
+                }
+                rp.AllExtensionNumbersResponse(x) => { String.from("extension numbers") }
+            }
+        }
+        None => String.from("nothing")
+    }
+}
+
+fn main() uses net, io, clock, threads {
+    let dreg = pb.registry()
+    let mut descs: List[proto.FileDesc] = List.new()
+    pb.add_descs(inout descs)
+    let svcs = reflection.with(descs, List[greeter.service()])
+    let rreg = rp.registry()
+    let rq = def.codec[rp.ServerReflectionRequest](rreg, "grpc.reflection.v1.ServerReflectionRequest")
+    let rs = def.codec[rp.ServerReflectionResponse](rreg, "grpc.reflection.v1.ServerReflectionResponse")
+
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let srv = spawn(|| -> i32 {
+        let z = h2.serve(sw, h2.options(), grpc.handler(svcs))
+        0
+    })
+    let cl = h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()).unwrap()
+    let ch = grpc.channel(cl, "t")
+    for v in List[1, 2] {
+        let version = if v == 1 { "v1" } else { "v1alpha" }
+        let mut hdr = String.from("-- ")
+        hdr.push_str(version)
+        say(hdr)
+        let call = if v == 1 {
+            grpc.bidi(ch, "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", rq, rs, grpc.call_opts()).unwrap()
+        } else {
+            grpc.bidi(ch, "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo", rq, rs, grpc.call_opts()).unwrap()
+        }
+        let asks = List[
+            req(rp.ListServices(String.from("*"))),
+            req(rp.FileByFilename(String.from("demo.proto"))),
+            req(rp.FileContainingSymbol(String.from("demo.Greeter"))),
+            req(rp.FileContainingSymbol(String.from("demo.Greeter.SayHello"))),
+            req(rp.FileContainingSymbol(String.from("demo.HelloRequest"))),
+            req(rp.FileContainingSymbol(String.from("demo.Nothing"))),
+            req(rp.FileByFilename(String.from("nope.proto"))),
+            req(rp.AllExtensionNumbersOfType(String.from("demo.HelloRequest"))),
+            req(rp.FileContainingSymbol(String.from("grpc.reflection.v1.ServerReflection")))]
+        for a in asks {
+            let z = call.send(a)
+            match call.recv() {
+                Ok(Some(r)) => { say(show(r)) }
+                _ => { say(String.from("no answer")) }
+            }
+        }
+        let zc = call.close_send()
+        let fin = call.recv()
+        call.done()
+        if v == 1 { say(String.from("ended ok")) }
+    }
+    cl.close()
+    let z6 = srv.join()
+    say(String.from("done"))
+}
