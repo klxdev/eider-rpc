@@ -9,7 +9,7 @@
 # built once under ThreadSanitizer and run once each, when $CC can build a TSan program
 # (else `skip`). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN="examples/kvstore/tests/e2e_test.ei tests/service_test.ei"
+TSAN="examples/kvstore/tests/e2e_test.ei tests/service_test.ei tests/grpc_test.ei tests/grpc_wire_test.ei tests/grpc_upgrade_test.ei tests/stubs_test.ei tests/control_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?
@@ -22,6 +22,14 @@ for f in tests/*.ei examples/*/tests/*.ei; do
   got=$(ei run "$f" 2>&1 < /dev/null)
   if [ "$got" = "$(cat "${f%.ei}.out")" ]; then echo "ok   $f"; else echo "FAIL $f"; echo "$got" | diff "${f%.ei}.out" - | head -10; fail=1; fi
 done
+# gRPC and Connect against grpcurl, Go (grpc-go) and curl (tests/grpc_interop.sh; `skip` for what is not installed)
+B=$(mktemp -d)
+if ei build tests/grpc_interop_server.ei -o "$B/grpcsrv" > "$B/log" 2>&1 && ei build tests/grpc_interop_client.ei -o "$B/grpccli" >> "$B/log" 2>&1; then
+  sh tests/grpc_interop.sh "$B" || fail=1
+else
+  echo "FAIL grpc interop: build"; cat "$B/log"; fail=1
+fi
+rm -rf "$B"
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT

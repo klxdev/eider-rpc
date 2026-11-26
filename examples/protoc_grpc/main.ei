@@ -1,0 +1,89 @@
+// A command line over eider-proto's proto/gen and rpc/gen: the message modules and the gRPC service modules of .proto files.
+//
+//   eider run examples/protoc_grpc/main.ei <out dir> <include dir> <strip prefix|-> <package prefix|-> <root.proto>...
+//
+// For every file a root imports there is a message module (`<module>.ei`), and for every file with services a `<module>_grpc.ei`
+// (handlers record + `<service>_service`, client + `<service>_client`). Import paths are found under the include dir with
+// <strip prefix> removed; `package prefix` is what the modules are imported from (`<your package>.<dir>`).
+
+import std.env
+import std.fs
+import std.io
+import std.utf8
+import proto.gen as pgen
+import rpc.gen
+
+fn main() uses io, fs {
+    let a = env.args()
+    if a.len() < 6 {
+        io.errln("usage: protoc_grpc <out dir> <include dir> <strip prefix|-> <package prefix|-> <root.proto>...".bytes())
+        return
+    }
+    let out_dir = utf8.lossy(a[1].copy())
+    let inc = utf8.lossy(a[2].copy())
+    let strip = utf8.lossy(a[3].copy())
+    let pkg = utf8.lossy(a[4].copy())
+    let mut roots: List[String] = List.new()
+    for i in 5..a.len() { roots.push(utf8.lossy(a[i as usize].copy())) }
+    let load = |p: String| -> Option[List[u8]] {
+        let mut path = p.copy()
+        if strip != String.from("-") && strip.len() > 0 && p.len() > strip.len() {
+            let pb = p.bytes()
+            let sb = strip.bytes()
+            let mut same = true
+            for i in 0..sb.len() {
+                if pb[i] != sb[i] { same = false }
+            }
+            if same { path = String.from_bytes(pb.slice(sb.len(), pb.len())).unwrap() }
+        }
+        let mut full = inc.copy()
+        full.push_str("/")
+        full.append(path)
+        match fs.read(full.bytes()) {
+            Ok(b) => Some(b)
+            Err(e) => None
+        }
+    }
+    let files = match pgen.load_all(roots, load) {
+        Ok(f) => f
+        Err(e) => {
+            io.errln(e.bytes())
+            return
+        }
+    }
+    let mut o = pgen.options()
+    if pkg != String.from("-") { o.prefix = pkg }
+    match pgen.generate(files.copy(), o.copy_options()) {
+        Ok(outs) => {
+            for x in outs {
+                let mut path = out_dir.copy()
+                path.push_str("/")
+                path.append(x.path.copy())
+                match fs.write(path.bytes(), x.text.bytes()) {
+                    Ok(z) => {}
+                    Err(e) => { io.errln(e.bytes()) }
+                }
+                io.outln(path.bytes())
+            }
+        }
+        Err(e) => {
+            io.errln(e.bytes())
+            return
+        }
+    }
+    match gen.generate(files, o) {
+        Ok(outs) => {
+            for x in outs {
+                let mut path = out_dir.copy()
+                path.push_str("/")
+                path.append(x.path.copy())
+                match fs.write(path.bytes(), x.text.bytes()) {
+                    Ok(z) => {}
+                    Err(e) => { io.errln(e.bytes()) }
+                }
+                io.outln(path.bytes())
+            }
+        }
+        Err(e) => { io.errln(e.bytes()) }
+    }
+}

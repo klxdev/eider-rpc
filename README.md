@@ -19,6 +19,7 @@ t.add("math.add", |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
 r.post("/rpc", jsonrpc.handler(t))      // r: an http/router Router
 ```
 
+- [docs/grpc.md](docs/grpc.md): gRPC (all four call kinds, over HTTP/2), Connect and JSON-RPC from one service definition (`rpc/def`, `rpc/grpc`, `rpc/connect`, `rpc/gen`).
 - [docs/jsonrpc.md](docs/jsonrpc.md): the module, its limits and tests.
 - [docs/guide.md](docs/guide.md): a JSON-RPC service step by step.
 - [examples/kvstore](examples/kvstore): a key-value store and a calculator over JSON-RPC, a

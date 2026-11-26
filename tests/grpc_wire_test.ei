@@ -1,0 +1,151 @@
+// gRPC at the byte level, all in Eider and independent of rpc/grpc's own client: raw HTTP/2 requests built by hand with
+// http/h2 against a server running rpc/grpc, and the exact response heads, frames and trailers checked against the
+// protocol (PROTOCOL-HTTP2.md): content types, the 5-byte message prefix, trailers-only errors, percent-encoded messages,
+// grpc-timeout, malformed requests.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.task
+import std.time
+import http
+import http.h2
+import http.transport
+import rpc.def
+import rpc.grpc
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn cat(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn hd(n: str, v: str) -> http.Header { http.Header(n.bytes(), v.bytes()) }
+
+fn call_head(path: str, extra: List[http.Header]) -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(hd(":method", "POST"))
+    r.push(hd(":scheme", "http"))
+    r.push(hd(":path", path))
+    r.push(hd(":authority", "t"))
+    r.push(hd("content-type", "application/grpc"))
+    r.push(hd("te", "trailers"))
+    for h in extra { r.push(h) }
+    r
+}
+
+fn dump(hs: List[http.Header]) -> String {
+    let mut l = String.from("")
+    for h in hs {
+        l.append(sys.to_string(h.name.copy()))
+        l.push_str("=")
+        l.append(sys.to_string(h.value.copy()))
+        l.push_str(" ")
+    }
+    l
+}
+
+fn read_all(s: h2.Stream) -> List[u8] uses io, clock {
+    let mut out: List[u8] = List.new()
+    while true {
+        match s.read(65536, time.after(time.seconds(10))) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                out.extend(b)
+            }
+            Err(e) => { break }
+        }
+    }
+    out
+}
+
+/// A call: the request head and body (frames), the response head, body and trailers.
+fn exchange(c: h2.Client, path: str, extra: List[http.Header], body: List[u8]) uses io, clock {
+    say(cat("> ", String.from(path)))
+    let s = c.open(call_head(path, extra), false, time.after(time.seconds(10))).unwrap()
+    let z = s.send(body, true, time.after(time.seconds(10)))
+    let head = s.headers(time.after(time.seconds(10))).unwrap()
+    say(cat("  head: ", dump(head)))
+    let data = read_all(s)
+    say(cat("  body: ", encoding.hex(data.copy())))
+    match s.trailers() {
+        Some(t) => { say(cat("  trailers: ", dump(t))) }
+        None => { say(String.from("  trailers: none")) }
+    }
+    s.release()
+}
+
+fn main() uses net, io, clock, threads {
+    let svcs = List[greeter.service()]
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let srv = spawn(|| -> i32 {
+        let z = h2.serve(sw, h2.options(), grpc.handler(svcs))
+        0
+    })
+    let c = h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()).unwrap()
+    // HelloRequest{name: "world"} is 0a 05 "world"
+    let req = grpc.frame(unhex("0a05776f726c64"))
+    say(String.from("-- a unary call: head, one framed message, trailers with grpc-status 0"))
+    exchange(c, "/demo.Greeter/SayHello", List.new(), req)
+    say(String.from("-- an error status: the grpc-message is percent-encoded, custom trailers follow"))
+    exchange(c, "/demo.Greeter/Fail", List.new(), grpc.frame(unhex("0a06c3a9c3a8c3b1")))
+    say(String.from("-- an unknown method: a trailers-only response (the head carries the status, END_STREAM)"))
+    exchange(c, "/demo.Greeter/Nope", List.new(), req)
+    say(String.from("-- the grpc-timeout is read: 5 seconds is plenty"))
+    exchange(c, "/demo.Greeter/SayHello", List[hd("grpc-timeout", "5S")], req)
+    say(String.from("-- a bad grpc-timeout is INTERNAL"))
+    exchange(c, "/demo.Greeter/SayHello", List[hd("grpc-timeout", "5X")], req)
+    say(String.from("-- an unsupported grpc-encoding is UNIMPLEMENTED"))
+    exchange(c, "/demo.Greeter/SayHello", List[hd("grpc-encoding", "gzip")], req)
+    say(String.from("-- a compressed message (flag 1) is UNIMPLEMENTED"))
+    let mut compressed = grpc.frame(unhex("0a05776f726c64"))
+    compressed[0] = 1
+    exchange(c, "/demo.Greeter/SayHello", List.new(), compressed)
+    say(String.from("-- a message that is cut short ends the call as INTERNAL"))
+    exchange(c, "/demo.Greeter/SayHello", List.new(), unhex("000000000a0a05"))
+    say(String.from("-- an empty request body for a unary method is INVALID_ARGUMENT"))
+    exchange(c, "/demo.Greeter/SayHello", List.new(), List.new())
+    say(String.from("-- two request messages for a unary method are INVALID_ARGUMENT"))
+    let mut two = req.copy()
+    two.extend(req.copy())
+    exchange(c, "/demo.Greeter/SayHello", List.new(), two)
+    say(String.from("-- a message over the 4 MiB limit is RESOURCE_EXHAUSTED (the length prefix alone says so)"))
+    exchange(c, "/demo.Greeter/SayHello", List.new(), unhex("00ffffffff"))
+    say(String.from("-- a stream that is not gRPC gets 415"))
+    let mut plain: List[http.Header] = List.new()
+    plain.push(hd(":method", "POST"))
+    plain.push(hd(":scheme", "http"))
+    plain.push(hd(":path", "/demo.Greeter/SayHello"))
+    plain.push(hd(":authority", "t"))
+    plain.push(hd("content-type", "application/json"))
+    let s = c.open(plain, true, time.after(time.seconds(10))).unwrap()
+    say(cat("  head: ", dump(s.headers(time.after(time.seconds(10))).unwrap())))
+    s.release()
+    say(String.from("-- the content type may carry +proto"))
+    let mut pj: List[http.Header] = List.new()
+    pj.push(hd(":method", "POST"))
+    pj.push(hd(":scheme", "http"))
+    pj.push(hd(":path", "/demo.Greeter/SayHello"))
+    pj.push(hd(":authority", "t"))
+    pj.push(hd("content-type", "application/grpc+proto"))
+    let s2 = c.open(pj, false, time.after(time.seconds(10))).unwrap()
+    let z3 = s2.send(req, true, time.after(time.seconds(10)))
+    say(cat("  head: ", dump(s2.headers(time.after(time.seconds(10))).unwrap())))
+    let d2 = read_all(s2)
+    s2.release()
+    c.close()
+    let z4 = srv.join()
+    say(String.from("done"))
+}
+
+fn unhex(s: str) -> List[u8] { encoding.unhex(s.bytes()).unwrap() }

@@ -3,6 +3,17 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+gRPC and Connect alongside JSON-RPC (eider-rpc#3). Docs: docs/grpc.md. Needs eider-http with HTTP/2 (`http/h2`) and eider-proto.
+
+- **`rpc/def`**: a service defined once (`service`, `unary`, `server_stream`, `client_stream`, `bidi`) with a `Codec` per message type (protobuf and JSON), `Ctx`, `Status` and the gRPC status codes; `mount_jsonrpc` serves its unary methods on a JSON-RPC table.
+- **`rpc/grpc`**: gRPC over `http/h2`, server (`handler`, `middleware` for `server.Config.h2_wrap`) and client (`channel`, `unary`, `server_stream`, `client_stream`, `bidi`): framing, trailers and trailers-only errors, metadata (`-bin`), `grpc-timeout` and deadlines, cancellation, any connected duplex (also the `Client` of `h2.accept_client`). Compression off.
+- **`rpc/connect`**: the Connect protocol, unary, JSON and protobuf bodies.
+- **`rpc/gen`** and `examples/protoc_grpc`: handler records, `<service>_service` and typed clients generated from `.proto` services.
+- Tested without another language (`tests/grpc_test`, `grpc_wire_test`, `grpc_upgrade_test`, `stubs_test`, `control_test`, which serves BuildKit's real Control service) and against grpcurl, grpc-go (client and server) and curl (`tests/grpc_interop.sh`).
+- New dependency: `[deps.proto]` (eider-proto, pure).
+
 ## 0.7.1
 
 For Eider 0.7 (`eider = "0.7"`). A breaking move, before 1.0 (eider-rpc#2, partly):

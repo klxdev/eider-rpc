@@ -1,0 +1,40 @@
+-- unary
+Hello, world
+-- an error status, with its message and trailer
+NOT_FOUND: no such user: bob
+-- an unknown method and an unknown service
+UNIMPLEMENTED: unknown service or method
+UNIMPLEMENTED: unknown service or method
+-- metadata in and out, a binary value
+token=abc raw=4
+ended ok
+response header x-seen=abc
+trailer x-done=1
+-- server streaming
+1 2 3 4 5 
+-- client streaming
+sum=5050
+-- bidirectional: each message is answered before the next is sent
+echo: one
+echo: two
+echo: three
+stream ended ok
+-- a deadline shorter than the work
+DEADLINE_EXCEEDED: the deadline passed
+-- and one that is long enough
+done in time: 20
+-- the client cancels a call
+CANCELLED: the call was cancelled
+-- the connection is still good after all that
+Hello, again
+-- the same service over Connect (JSON and protobuf bodies) and JSON-RPC
+connect json: 200
+{"message":"Hello, json","unknown_fields":""}
+connect proto: 200
+Hello, proto
+connect error: 404
+{"code":"not_found","message":"no such user: z"}
+connect streaming method: 501
+{"jsonrpc":"2.0","result":{"message":"Hello, rpc","unknown_fields":""},"id":1}
+{"jsonrpc":"2.0","error":{"code":-32005,"message":"no such user: rpc","data":"NOT_FOUND"},"id":2}
+done

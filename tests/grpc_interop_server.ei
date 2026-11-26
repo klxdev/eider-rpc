@@ -1,0 +1,46 @@
+// An Eider server for tests/grpc_interop.sh: demo.Greeter over gRPC (HTTP/2 prior-knowledge, and with TLS when a chain
+// and key are given) and over Connect (HTTP/1.1 or HTTP/2 POST /demo.Greeter/<Method>) on ONE port, behind the same
+// eider-http server. Prints `listening <port>` once it is up; GET /quit stops it.
+//
+//   grpc_interop_server [chain.pem key.pem]
+
+import core.sys
+import std.env
+import std.io
+import std.net
+import std.task
+import std.utf8
+import http
+import http.h2
+import http.router
+import http.server
+import http.secure
+import rpc.connect
+import rpc.grpc
+import rpc.tests.demo.greeter as greeter
+
+fn main() uses io, net, clock, threads, fs {
+    let a = env.args()
+    let tok = task.root()
+    let svcs = List[greeter.service()]
+    let mut r = router.new()
+    let t2 = tok
+    r.get("/quit", |q: http.Request| -> http.Response {
+        t2.cancel()
+        http.text(200, "bye")
+    })
+    let conn = connect.handler(svcs)
+    r.post("/demo.Greeter/:method", conn)
+    let mut cfg = server.config()
+    cfg.h2 = Some(h2.options())
+    cfg.h2_wrap = Some(grpc.middleware(svcs))
+    if a.len() >= 3 {
+        let tls = secure.server_from_files(utf8.lossy(a[1].copy()), utf8.lossy(a[2].copy())).unwrap().with_h2()
+        cfg.secure = Some(tls.acceptor())
+    }
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let mut up = String.from("listening ")
+    up.append(String.from_int(srv.port() as i64))
+    io.outln(up.bytes())
+    let s = srv.serve(router.handler(r), tok).unwrap()
+}

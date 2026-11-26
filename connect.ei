@@ -1,0 +1,134 @@
+//! rpc/connect: the Connect protocol (https://connectrpc.com/docs/protocol/), unary calls, for services defined with
+//! `rpc/def`: an `http.Handler` that serves `POST /<service>/<Method>` with `application/json` or `application/proto`
+//! bodies, over HTTP/1.1 or HTTP/2, so any HTTP client (curl, a browser, `fetch`) can call a service that gRPC clients
+//! also call.
+//!
+//! A success is `200` with the response message in the request's content type. A failure is the HTTP status of its
+//! code and a JSON body `{"code": "not_found", "message": "..."}` (the Connect error format; the codes are the gRPC
+//! ones in lowercase). `connect-timeout-ms` is the call's deadline. The request headers (except the transport's own)
+//! are the call's metadata and `Ctx.set_header` adds response headers. Streaming methods are not served here (they
+//! are `unimplemented`: use gRPC); the Connect streaming envelope is not implemented.
+
+import core.sys
+import std.bytes
+import std.time
+import json
+import http
+import rpc.def
+
+fn lower_code(code: i32) -> List[u8] {
+    let n = def.code_name(code).bytes()
+    let mut out: List[u8] = List.new()
+    for c in n { out.push(if c >= 65 && c <= 90 { c + 32 } else { c }) }
+    // CANCELLED is `canceled` in Connect
+    if code == def.CANCELLED { return "canceled".bytes() }
+    out
+}
+
+/// The HTTP status Connect uses for a code.
+pub fn http_status(code: i32) -> i32 {
+    if code == def.CANCELLED { return 499 }
+    if code == def.INVALID_ARGUMENT || code == def.FAILED_PRECONDITION || code == def.OUT_OF_RANGE { return 400 }
+    if code == def.DEADLINE_EXCEEDED { return 504 }
+    if code == def.NOT_FOUND { return 404 }
+    if code == def.ALREADY_EXISTS || code == def.ABORTED { return 409 }
+    if code == def.PERMISSION_DENIED { return 403 }
+    if code == def.RESOURCE_EXHAUSTED { return 429 }
+    if code == def.UNIMPLEMENTED { return 501 }
+    if code == def.UNAVAILABLE { return 503 }
+    if code == def.UNAUTHENTICATED { return 401 }
+    500
+}
+
+fn error_response(st: def.Status) -> http.Response {
+    let mut body = "{{\"code\":".bytes()
+    body.extend(json.quote(lower_code(st.code)))
+    if st.message.len() > 0 {
+        body.extend(",\"message\":".bytes())
+        body.extend(json.quote(st.message.bytes()))
+    }
+    body.push(125)
+    http.respond(http_status(st.code), "application/json", body)
+}
+
+fn is_type(ct: List[u8], want: str) -> bool {
+    let m = http.media_type(ct)
+    http.eq_s(m, want)
+}
+
+/// The Connect handler for `services`: mount it on a router (`r.post("/pkg.Service/Method", ...)` per method, or as the
+/// fallback) or use it as the server's handler.
+pub fn handler(services: List[def.Service]) -> http.Handler uses clock {
+    |q: http.Request| -> http.Response {
+        if !http.eq_s(q.method, "POST") {
+            let mut r = error_response(def.status(def.UNIMPLEMENTED, "Connect calls are POST requests"))
+            r.status = 405
+            r.set_header("Allow", "POST".bytes())
+            return r
+        }
+        // /<service>/<Method>
+        let path = q.path
+        let mut svc: List[u8] = List.new()
+        let mut m: List[u8] = List.new()
+        match bytes.rfind_byte(path, 47) {
+            Some(i) => {
+                if i > 1 {
+                    svc = path.slice(1, i)
+                    m = path.slice(i + 1, path.len())
+                }
+            }
+            None => {}
+        }
+        let ct = q.header("content-type").unwrap_or(List.new())
+        let json_body = is_type(ct, "application/json")
+        let proto_body = is_type(ct, "application/proto")
+        if !json_body && !proto_body {
+            let mut r = http.error_response(415)
+            r.set_header("Accept-Post", "application/json, application/proto".bytes())
+            return r
+        }
+        let mut found: Option[def.Method] = None
+        for s in services {
+            if bytes.eq(s.name.bytes(), svc) { found = s.find(m) }
+        }
+        let method = match found {
+            Some(x) => x
+            None => { return error_response(def.status(def.NOT_FOUND, "unknown service or method")) }
+        }
+        let call = if json_body { method.json } else { method.proto }
+        let f = match call {
+            Some(x) => x
+            None => { return error_response(def.status(def.UNIMPLEMENTED, "a streaming method is served over gRPC only")) }
+        }
+        let mut dl = time.never()
+        match q.header("connect-timeout-ms") {
+            Some(t) => {
+                match bytes.parse_u64(t) {
+                    Some(ms) => { dl = time.after_ms(ms as i64) }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        let mut md: List[http.Header] = List.new()
+        for h in q.headers {
+            let n = http.lower(h.name)
+            if http.eq_s(n, "content-type") || http.eq_s(n, "content-length") || http.eq_s(n, "host") || http.eq_s(n, "connection") || http.eq_s(n, "accept-encoding") { continue }
+            if n.len() > 8 && bytes.eq(n.slice(0, 8), "connect-".bytes()) { continue }
+            md.push(http.Header(n, h.value))
+        }
+        let mut name = String.from("/")
+        name.append(String.from_bytes(svc.copy()).unwrap_or(String.from("")))
+        name.push_str("/")
+        name.append(String.from_bytes(m.copy()).unwrap_or(String.from("")))
+        let ctx = def.ctx(name, md, dl, String.from_bytes(q.peer.copy()).unwrap_or(String.from("")))
+        match f(ctx, q.body) {
+            Ok(b) => {
+                let mut r = http.respond(200, if json_body { "application/json" } else { "application/proto" }, b)
+                for h in ctx.headers_out() { r.headers.push(h) }
+                r
+            }
+            Err(st) => error_response(st)
+        }
+    }
+}

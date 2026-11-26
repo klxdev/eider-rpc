@@ -1,0 +1,370 @@
+//! rpc/def: a service defined once, in terms of typed methods, and served over any of the wire protocols:
+//! gRPC (`rpc/grpc`, over HTTP/2), Connect (`rpc/connect`, unary over any HTTP version) and JSON-RPC 2.0
+//! (`def.mount_jsonrpc`, on the `rpc/jsonrpc` table). The messages are generated types (`eider-proto`'s `proto/gen`:
+//! `@[derive(Serialize, Deserialize)]` records with a schema), so a `Codec` knows both their protobuf and their JSON
+//! forms.
+//!
+//!     let reg = pb.registry()                                    // the generated module's schema
+//!     let svc = def.service("demo.Greeter")
+//!         .unary("SayHello", def.codec[pb.HelloRequest](reg, "demo.HelloRequest"),
+//!                            def.codec[pb.HelloReply](reg, "demo.HelloReply"),
+//!                | ctx: def.Ctx, q: pb.HelloRequest | ...Ok(reply)...)
+//!         .bidi("Chat", qc, rc, |ctx: def.Ctx, inp: def.In[Msg], out: def.Out[Msg]| ...)
+//!
+//! A method is one of four kinds: unary (`unary`), server-streaming (`server_stream`: one request, a stream of
+//! replies), client-streaming (`client_stream`: a stream of requests, one reply) and bidirectional (`bidi`). Unary
+//! methods are served by every protocol; streaming ones only by gRPC. A handler gets a `Ctx` (the request metadata, the
+//! deadline, a place for response headers and trailers) and returns `Err(Status)` for a failure: the status code is
+//! what gRPC puts in its trailers, what Connect maps to an HTTP status and a code name, and what JSON-RPC carries in
+//! `error.data`.
+//!
+//! Messages are protobuf bytes inside the library (`proto.encode`/`decode` through the generated registry); JSON uses
+//! eider-json's derived codec of the same record (field names as generated: snake_case, not protobuf's JSON mapping).
+
+import core.sys
+import std.bytes
+import std.serial
+import std.strings
+import std.sync
+import std.time
+import json
+import http
+import proto
+import rpc.jsonrpc
+
+// ---- status ----
+
+pub const OK: i32 = 0
+pub const CANCELLED: i32 = 1
+pub const UNKNOWN: i32 = 2
+pub const INVALID_ARGUMENT: i32 = 3
+pub const DEADLINE_EXCEEDED: i32 = 4
+pub const NOT_FOUND: i32 = 5
+pub const ALREADY_EXISTS: i32 = 6
+pub const PERMISSION_DENIED: i32 = 7
+pub const RESOURCE_EXHAUSTED: i32 = 8
+pub const FAILED_PRECONDITION: i32 = 9
+pub const ABORTED: i32 = 10
+pub const OUT_OF_RANGE: i32 = 11
+pub const UNIMPLEMENTED: i32 = 12
+pub const INTERNAL: i32 = 13
+pub const UNAVAILABLE: i32 = 14
+pub const DATA_LOSS: i32 = 15
+pub const UNAUTHENTICATED: i32 = 16
+
+/// The result of a call: a gRPC status `code` (`OK` .. `UNAUTHENTICATED`), a message for people, and optional binary
+/// `details` (a serialized `google.rpc.Status`, sent as `grpc-status-details-bin`; empty: none).
+pub type Status = { code: i32, message: String, details: List[u8] }
+
+pub fn status(code: i32, message: str) -> Status { Status(code, String.from(message), List.new()) }
+
+pub fn status_text(code: i32, message: String) -> Status { Status(code, message, List.new()) }
+
+pub fn ok() -> Status { Status(0, String.from(""), List.new()) }
+
+/// The name of a status code (`NOT_FOUND`).
+pub fn code_name(code: i32) -> String {
+    let names = List["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
+    if code < 0 || code > 16 { return String.from("UNKNOWN") }
+    String.from(names[code as usize])
+}
+
+impl Show for Status {
+    fn show(self, inout out: String) {
+        out.append(code_name(self.code))
+        if self.message.len() > 0 {
+            out.push_str(": ")
+            out.append(self.message.copy())
+        }
+    }
+}
+
+// ---- the call's context ----
+
+type CtxOut = { header: List[http.Header], trailer: List[http.Header] }
+
+/// What a handler knows about the call and can say about it. `metadata` is the request's (lowercase keys; `-bin` keys
+/// hold the decoded bytes), `deadline` when the caller gave up (never: no timeout), `peer` the caller's address
+/// when the transport knows it.
+pub type Ctx = { method: String, metadata: List[http.Header], deadline: time.Deadline, peer: String, out: sync.Lock[CtxOut] }
+
+pub fn ctx(method: String, metadata: List[http.Header], deadline: time.Deadline, peer: String) -> Ctx {
+    Ctx(method, metadata, deadline, peer, sync.lock(CtxOut(List.new(), List.new())))
+}
+
+impl Ctx {
+    /// The first request metadata value for `key` (lowercase).
+    fn get(self, key: str) -> Option[List[u8]] { http.find_s(self.metadata, key) }
+
+    /// A header to send with the response head (before the first message).
+    fn set_header(self, key: str, value: List[u8]) {
+        let k = key.bytes()
+        self.out.modify(|inout o: CtxOut| -> () { o.header.push(http.Header(k, value)) })
+    }
+
+    /// A trailer, sent after the last message with the status.
+    fn set_trailer(self, key: str, value: List[u8]) {
+        let k = key.bytes()
+        self.out.modify(|inout o: CtxOut| -> () { o.trailer.push(http.Header(k, value)) })
+    }
+
+    fn headers_out(self) -> List[http.Header] { self.out.modify(|inout o: CtxOut| -> List[http.Header] { o.header.copy() }) }
+
+    fn trailers_out(self) -> List[http.Header] { self.out.modify(|inout o: CtxOut| -> List[http.Header] { o.trailer.copy() }) }
+
+    /// Whether the deadline has passed.
+    fn expired(self) -> bool uses clock { self.deadline.expired() }
+}
+
+// ---- codecs ----
+
+/// How messages of type T go to and from bytes: protobuf (`enc`, `dec`) and JSON (`jenc`, `jdec`).
+pub type Codec[T] = {
+    enc: fn(T) -> Result[List[u8], String],
+    dec: fn(List[u8]) -> Result[T, String],
+    jenc: fn(T) -> Result[List[u8], String],
+    jdec: fn(List[u8]) -> Result[T, String],
+}
+
+fn text_of(e: serial.Error) -> String { String.from_bytes(serial.error_text(e)).unwrap_or(String.from("a message error")) }
+
+/// The codec of generated message type T, named `msg` (`pkg.Message`) in `reg`.
+pub fn codec[T: serial.Serialize + serial.Deserialize](reg: proto.Registry, msg: str) -> Codec[T] {
+    let name = String.from(msg)
+    let n1 = name.copy()
+    let n2 = name.copy()
+    Codec(
+        |x: T| -> Result[List[u8], String] {
+            match proto.encode(reg, n1.copy(), x) {
+                Ok(b) => Ok(b)
+                Err(e) => Err(text_of(e))
+            }
+        },
+        |b: List[u8]| -> Result[T, String] {
+            match proto.decode[T](reg, n2.copy(), b) {
+                Ok(x) => Ok(x)
+                Err(e) => Err(text_of(e))
+            }
+        },
+        |x: T| -> Result[List[u8], String] {
+            match json.to_bytes(x) {
+                Ok(b) => Ok(b)
+                Err(e) => Err(text_of(e))
+            }
+        },
+        |b: List[u8]| -> Result[T, String] {
+            match json.from_bytes[T](b) {
+                Ok(x) => Ok(x)
+                Err(e) => Err(text_of(e))
+            }
+        })
+}
+
+// ---- messages in and out of a handler ----
+
+/// The request messages of a call, as bytes: `next()` gives the next one, `Ok(None)` at the end of the stream.
+pub type RawIn = { next: fn() -> Result[Option[List[u8]], Status] }
+
+/// Where a handler's response messages go, as bytes.
+pub type RawOut = { put: fn(List[u8]) -> Result[(), Status] }
+
+/// The request messages of a streaming call as values of type Q.
+pub type In[Q] = { raw: RawIn, dec: fn(List[u8]) -> Result[Q, String] }
+
+impl[Q] In[Q] {
+    /// The next request message; `Ok(None)` when the caller has finished sending; `Err` when the call failed (cancelled,
+    /// the deadline passed, the connection broke) or a message is not a valid Q (`INVALID_ARGUMENT`).
+    fn recv(self) -> Result[Option[Q], Status] {
+        let nx = self.raw.next
+        match nx()? {
+            Some(b) => {
+                let d = self.dec
+                match d(b) {
+                    Ok(q) => Ok(Some(q))
+                    Err(e) => Err(status_text(INVALID_ARGUMENT, e))
+                }
+            }
+            None => Ok(None)
+        }
+    }
+}
+
+/// The response messages of a streaming call.
+pub type Out[R] = { raw: RawOut, enc: fn(R) -> Result[List[u8], String] }
+
+impl[R] Out[R] {
+    /// Sends a response message (the response head goes first, with the headers set so far).
+    fn send(self, r: R) -> Result[(), Status] {
+        let e = self.enc
+        match e(r) {
+            Ok(b) => {
+                let p = self.raw.put
+                p(b)
+            }
+            Err(why) => Err(status_text(INTERNAL, why))
+        }
+    }
+}
+
+// ---- services ----
+
+/// 0 unary, 1 server-streaming, 2 client-streaming, 3 bidirectional.
+pub const UNARY: i32 = 0
+pub const SERVER_STREAM: i32 = 1
+pub const CLIENT_STREAM: i32 = 2
+pub const BIDI: i32 = 3
+
+/// A method: `run` serves it over any streaming transport (gRPC); `proto` and `json` (unary methods only) take one
+/// request body and give one response body, for Connect and JSON-RPC.
+pub type Method = {
+    name: String,
+    kind: i32,
+    run: fn(Ctx, RawIn, RawOut) -> Result[(), Status],
+    proto: Option[fn(Ctx, List[u8]) -> Result[List[u8], Status]],
+    json: Option[fn(Ctx, List[u8]) -> Result[List[u8], Status]],
+}
+
+/// A named service (`pkg.Greeter`) and its methods.
+pub type Service = { name: String, methods: List[Method] }
+
+pub fn service(name: str) -> Service { Service(String.from(name), List.new()) }
+
+impl Service {
+    /// The method `name` (`SayHello`).
+    fn find(self, name: List[u8]) -> Option[Method] {
+        for m in self.methods {
+            if bytes.eq(m.name.bytes(), name) { return Some(m) }
+        }
+        None
+    }
+
+    fn with(self, m: Method) -> Service {
+        let mut s = self.copy()
+        s.methods.push(m)
+        s
+    }
+
+    /// A unary method: one request, one response.
+    fn unary[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, Q) -> Result[R, Status]) -> Service {
+        let dec = qc.dec
+        let enc = rc.enc
+        let jdec = qc.jdec
+        let jenc = rc.jenc
+        let proto_call = |c: Ctx, b: List[u8]| -> Result[List[u8], Status] {
+            let q = match dec(b) {
+                Ok(x) => x
+                Err(e) => { return Err(status_text(INVALID_ARGUMENT, e)) }
+            }
+            let r = f(c, q)?
+            match enc(r) {
+                Ok(out) => Ok(out)
+                Err(e) => Err(status_text(INTERNAL, e))
+            }
+        }
+        let json_call = |c: Ctx, b: List[u8]| -> Result[List[u8], Status] {
+            let q = match jdec(b) {
+                Ok(x) => x
+                Err(e) => { return Err(status_text(INVALID_ARGUMENT, e)) }
+            }
+            let r = f(c, q)?
+            match jenc(r) {
+                Ok(out) => Ok(out)
+                Err(e) => Err(status_text(INTERNAL, e))
+            }
+        }
+        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
+            let nx = inp.next
+            let first = nx()?
+            let body = match first {
+                Some(b) => b
+                None => { return Err(status(INVALID_ARGUMENT, "the request has no message")) }
+            }
+            let second = nx()?
+            if second.is_some() { return Err(status(INVALID_ARGUMENT, "a unary request has one message")) }
+            let r = proto_call(c, body)?
+            let p = out.put
+            p(r)
+        }
+        self.with(Method(String.from(name), UNARY, run, Some(proto_call), Some(json_call)))
+    }
+
+    /// A server-streaming method: one request, then `out.send` as many responses as it likes.
+    fn server_stream[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, Q, Out[R]) -> Result[(), Status]) -> Service {
+        let dec = qc.dec
+        let enc = rc.enc
+        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
+            let nx = inp.next
+            let first = nx()?
+            let body = match first {
+                Some(b) => b
+                None => { return Err(status(INVALID_ARGUMENT, "the request has no message")) }
+            }
+            let second = nx()?
+            if second.is_some() { return Err(status(INVALID_ARGUMENT, "a server-streaming request has one message")) }
+            let q = match dec(body) {
+                Ok(x) => x
+                Err(e) => { return Err(status_text(INVALID_ARGUMENT, e)) }
+            }
+            f(c, q, Out(out, enc))
+        }
+        self.with(Method(String.from(name), SERVER_STREAM, run, None, None))
+    }
+
+    /// A client-streaming method: `inp.recv` the requests until `None`, then one response.
+    fn client_stream[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, In[Q]) -> Result[R, Status]) -> Service {
+        let dec = qc.dec
+        let enc = rc.enc
+        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
+            let r = f(c, In(inp, dec))?
+            match enc(r) {
+                Ok(b) => {
+                    let p = out.put
+                    p(b)
+                }
+                Err(e) => Err(status_text(INTERNAL, e))
+            }
+        }
+        self.with(Method(String.from(name), CLIENT_STREAM, run, None, None))
+    }
+
+    /// A bidirectional method: requests in, responses out, in any interleaving.
+    fn bidi[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, In[Q], Out[R]) -> Result[(), Status]) -> Service {
+        let dec = qc.dec
+        let enc = rc.enc
+        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] { f(c, In(inp, dec), Out(out, enc)) }
+        self.with(Method(String.from(name), BIDI, run, None, None))
+    }
+}
+
+// ---- the same service over JSON-RPC ----
+
+fn rpc_error(st: Status) -> jsonrpc.Error {
+    jsonrpc.error_data(-32000 - (st.code as i64), st.message.bytes(), json.quote(code_name(st.code).bytes()))
+}
+
+/// Mounts the unary methods of `svc` on a JSON-RPC table as `<service>.<Method>` (`demo.Greeter.SayHello`): the call's
+/// `params` (an object) are the request record, the result is the response record, a `Status` is an error with code
+/// `-32000 - status code` (the range JSON-RPC keeps for servers) and the status name as its data. Streaming methods are
+/// not mounted.
+pub fn mount_jsonrpc(inout t: jsonrpc.Table, svc: Service) {
+    for m in svc.methods {
+        match m.json {
+            Some(f) => {
+                let mut full = svc.name.bytes()
+                full.push(46)
+                full.extend(m.name.bytes())
+                let name = svc.name.copy()
+                let mname = m.name.copy()
+                t.add_bytes(full, |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
+                    let body = if p.present { json.write(p.doc, p.node) } else { "{{}}".bytes() }
+                    let c = ctx(name.copy(), List.new(), time.never(), String.from(""))
+                    match f(c, body) {
+                        Ok(b) => Ok(b)
+                        Err(st) => Err(rpc_error(st))
+                    }
+                })
+            }
+            None => {}
+        }
+    }
+}

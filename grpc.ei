@@ -1,0 +1,707 @@
+//! rpc/grpc: gRPC (https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md) over `http/h2`, as a server and as a
+//! client, for services defined once with `rpc/def` (unary, server-streaming, client-streaming and bidirectional methods).
+//!
+//! Server: `grpc.handler(services)` is an `h2.StreamHandler` for `h2.serve` (a connection that speaks only gRPC) and
+//! `grpc.middleware(services)` an `h2.Middleware` for `server.Config.h2_wrap` (gRPC and ordinary HTTP on one port: a stream
+//! whose content type is `application/grpc` is gRPC, the rest goes to the HTTP handler). Any connected duplex can carry
+//! it: `h2.serve(h2.wire_of_transport(t), opts, grpc.handler(services))`, or the connection a handler took over with
+//! `h2.accept_server`.
+//!
+//! Client: `grpc.channel(h2_client, authority)` over an `h2.Client` (`h2.dial`, `secure.connect_h2`, or `h2.connect` over any
+//! duplex, including the `Client` of `h2.accept_client`: the daemon calling into a CLI over the connection the CLI made),
+//! then `unary`, `server_stream`, `client_stream` and `bidi`, each with the request and response `Codec`s.
+//!
+//! What it does as the protocol says: messages are framed with a flag byte (0, uncompressed) and a 4-byte big-endian
+//! length; the status goes in the trailers as `grpc-status` and `grpc-message` (percent-encoded; `grpc-status-details-bin`
+//! when `Status.details` is set), or in the headers alone ("trailers-only") when a call fails before its first message; an
+//! unknown service or method is `UNIMPLEMENTED`; `grpc-timeout` becomes the call's deadline (`Ctx.deadline`: reads and
+//! writes stop at it, `DEADLINE_EXCEEDED`), a client's `CallOpts.timeout` is sent as `grpc-timeout`; metadata is the
+//! request and response headers other than the reserved ones, with `-bin` keys carrying base64 bytes; a stream
+//! reset by the peer is `CANCELLED` (or what its error code maps to); a handler that traps is `INTERNAL`; an HTTP error from
+//! a non-gRPC server maps to the status the specification gives. A message over `max_recv` (4 MiB) is `RESOURCE_EXHAUSTED`.
+//!
+//! Compression is off: nothing is sent compressed, `grpc-accept-encoding: identity` is announced, and a message that arrives
+//! with the compressed flag is `UNIMPLEMENTED`.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.stream
+import std.sync
+import std.task
+import std.time
+import http
+import http.h2
+import http.h2frame
+import rpc.def
+
+// ---- framing, metadata, timeouts ----
+
+/// One message in a gRPC frame: a flag byte (0), the length (4 bytes, big endian) and the message.
+pub fn frame(msg: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    out.push(0)
+    let n = msg.len()
+    out.push(((n >> 24) & 255) as u8)
+    out.push(((n >> 16) & 255) as u8)
+    out.push(((n >> 8) & 255) as u8)
+    out.push((n & 255) as u8)
+    out.extend(msg)
+    out
+}
+
+fn hex_digit(n: u8) -> u8 { if n < 10 { 48 + n } else { 55 + n } }
+
+/// `grpc-message` text: bytes outside printable ASCII and `%` become `%XX`.
+pub fn percent_encode(s: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in s {
+        if c >= 32 && c <= 126 && c != 37 {
+            out.push(c)
+        } else {
+            out.push(37)
+            out.push(hex_digit(c / 16))
+            out.push(hex_digit(c % 16))
+        }
+    }
+    out
+}
+
+fn hex_val(c: u8) -> Option[u8] {
+    if c >= 48 && c <= 57 { return Some(c - 48) }
+    if c >= 65 && c <= 70 { return Some(c - 55) }
+    if c >= 97 && c <= 102 { return Some(c - 87) }
+    None
+}
+
+pub fn percent_decode(s: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < s.len() {
+        if s[i] == 37 && i + 2 < s.len() + 0 && i + 2 <= s.len() - 1 {
+            match hex_val(s[i + 1]) {
+                Some(h) => {
+                    match hex_val(s[i + 2]) {
+                        Some(l) => {
+                            out.push(h * 16 + l)
+                            i += 3
+                            continue
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        out.push(s[i])
+        i += 1
+    }
+    out
+}
+
+/// A `grpc-timeout` value (`5S`, `250m`: at most 8 digits and a unit H M S m u n) in nanoseconds.
+pub fn parse_timeout(v: List[u8]) -> Option[i64] {
+    if v.len() < 2 || v.len() > 9 { return None }
+    let unit = v[v.len() - 1]
+    let mut n: i64 = 0
+    for i in 0..(v.len() - 1) {
+        if v[i] < 48 || v[i] > 57 { return None }
+        n = n * 10 + ((v[i] - 48) as i64)
+    }
+    if unit == 72 { return Some(n * 3600000000000) }
+    if unit == 77 { return Some(n * 60000000000) }
+    if unit == 83 { return Some(n * 1000000000) }
+    if unit == 109 { return Some(n * 1000000) }
+    if unit == 117 { return Some(n * 1000) }
+    if unit == 110 { return Some(n) }
+    None
+}
+
+/// `ns` as a `grpc-timeout` value, in the coarsest unit that keeps it under 9 digits (rounded up).
+pub fn format_timeout(ns: i64) -> List[u8] {
+    let mut v: i64 = if ns < 1 { 1 } else { ns }
+    let units = List["n", "u", "m", "S", "M", "H"]
+    let div = List[1 as i64, 1000, 1000, 1000, 60, 60]
+    let mut i: usize = 0
+    while v > 99999999 && i < 5 {
+        i += 1
+        v = (v + div[i] - 1) / div[i]
+    }
+    let mut out = bytes.from_u64(v as u64)
+    out.extend(units[i].bytes())
+    out
+}
+
+fn reserved(n: List[u8]) -> bool {
+    if n.len() == 0 || n[0] == 58 { return true }
+    if http.eq_s(n, "content-type") || http.eq_s(n, "te") || http.eq_s(n, "content-length") || http.eq_s(n, "host") { return true }
+    if n.len() >= 5 && bytes.eq(n.slice(0, 5), "grpc-".bytes()) { return true }
+    false
+}
+
+fn is_bin(n: List[u8]) -> bool { n.len() > 4 && bytes.eq(n.slice(n.len() - 4, n.len()), "-bin".bytes()) }
+
+/// The application metadata of a header block: the reserved fields (pseudo-headers, `content-type`, `te`, `grpc-*`) are left
+/// out, and the value of a `-bin` key is decoded from base64.
+pub fn metadata_of(hs: List[http.Header]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for h in hs {
+        if reserved(h.name) { continue }
+        if is_bin(h.name) {
+            match encoding.base64_decode(h.value, encoding.Standard, encoding.Optional) {
+                Ok(b) => { out.push(http.Header(h.name, b)) }
+                Err(e) => {}
+            }
+        } else {
+            out.push(h)
+        }
+    }
+    out
+}
+
+/// Metadata as header fields: `-bin` values are base64.
+pub fn metadata_fields(md: List[http.Header]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for h in md {
+        let n = http.lower(h.name)
+        if reserved(n) { continue }
+        if is_bin(n) {
+            out.push(http.Header(n, encoding.base64_encode(h.value, encoding.Standard, false).bytes()))
+        } else {
+            out.push(http.Header(n, h.value))
+        }
+    }
+    out
+}
+
+/// What an h2 error means as a gRPC status.
+pub fn from_h2(e: h2.Error) -> def.Status {
+    if e.kind == h2.ERR_TIMEOUT { return def.status(def.DEADLINE_EXCEEDED, "the deadline passed") }
+    if e.kind == h2.ERR_RESET {
+        if e.code == h2frame.CANCEL { return def.status(def.CANCELLED, "the call was cancelled") }
+        if e.code == h2frame.REFUSED_STREAM { return def.status(def.UNAVAILABLE, "the stream was refused") }
+        if e.code == h2frame.ENHANCE_YOUR_CALM { return def.status(def.RESOURCE_EXHAUSTED, "the peer says to slow down") }
+        if e.code == h2frame.INADEQUATE_SECURITY { return def.status(def.PERMISSION_DENIED, "inadequate security") }
+        return def.status_text(def.INTERNAL, e.why)
+    }
+    if e.kind == h2.ERR_CLOSED { return def.status_text(def.UNAVAILABLE, e.why) }
+    def.status_text(def.INTERNAL, e.why)
+}
+
+/// The status the specification gives for an HTTP status of a response that is not gRPC.
+pub fn from_http(code: i32) -> def.Status {
+    let mut m = String.from("HTTP status ")
+    m.append(code.to_string())
+    if code == 400 { return def.status_text(def.INTERNAL, m) }
+    if code == 401 { return def.status_text(def.UNAUTHENTICATED, m) }
+    if code == 403 { return def.status_text(def.PERMISSION_DENIED, m) }
+    if code == 404 { return def.status_text(def.UNIMPLEMENTED, m) }
+    if code == 429 || code == 502 || code == 503 || code == 504 { return def.status_text(def.UNAVAILABLE, m) }
+    def.status_text(def.UNKNOWN, m)
+}
+
+fn is_grpc_type(ct: List[u8]) -> bool {
+    let n = "application/grpc".len()
+    if ct.len() < n || !bytes.eq(http.lower(ct.slice(0, n)), "application/grpc".bytes()) { return false }
+    if ct.len() == n { return true }
+    ct[n] == 43 || ct[n] == 59
+}
+
+/// Whether a header block is a gRPC call or response (`content-type: application/grpc`, with or without `+proto` or parameters).
+pub fn is_grpc(hs: List[http.Header]) -> bool {
+    match http.find_s(hs, "content-type") {
+        Some(ct) => is_grpc_type(ct)
+        None => false
+    }
+}
+
+// ---- reading messages ----
+
+/// A stream's incoming messages, reassembled from DATA.
+type Reader = { st: h2.Stream, buf: List[u8], max: usize, ended: bool }
+
+fn next_msg(inout r: Reader, dl: time.Deadline) -> Result[Option[List[u8]], def.Status] uses io, clock {
+    while true {
+        if r.buf.len() >= 5 {
+            let flag = r.buf[0]
+            let n = ((r.buf[1] as usize) << 24) | ((r.buf[2] as usize) << 16) | ((r.buf[3] as usize) << 8) | (r.buf[4] as usize)
+            if n > r.max { return Err(def.status(def.RESOURCE_EXHAUSTED, "a message is larger than the receive limit")) }
+            if r.buf.len() >= 5 + n {
+                let msg = r.buf.slice(5, 5 + n)
+                r.buf.remove_range(0, 5 + n)
+                if flag != 0 { return Err(def.status(def.UNIMPLEMENTED, "compressed messages are not supported (grpc-encoding: identity)")) }
+                return Ok(Some(msg))
+            }
+        }
+        if r.ended {
+            if r.buf.len() == 0 { return Ok(None) }
+            return Err(def.status(def.INTERNAL, "the stream ended inside a message"))
+        }
+        match r.st.read(65536, dl) {
+            Ok(b) => {
+                if b.len() == 0 { r.ended = true } else { r.buf.extend(b) }
+            }
+            Err(e) => { return Err(from_h2(e)) }
+        }
+    }
+    Ok(None)
+}
+
+// ---- the server ----
+
+fn content_type() -> List[u8] { "application/grpc".bytes() }
+
+fn head_fields(extra: List[http.Header]) -> List[http.Header] {
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(":status".bytes(), "200".bytes()))
+    hs.push(http.Header("content-type".bytes(), content_type()))
+    hs.push(http.Header("grpc-accept-encoding".bytes(), "identity".bytes()))
+    for f in metadata_fields(extra) { hs.push(f) }
+    hs
+}
+
+fn status_fields(st: def.Status, trailers: List[http.Header]) -> List[http.Header] {
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header("grpc-status".bytes(), st.code.to_string().bytes()))
+    if st.message.len() > 0 { hs.push(http.Header("grpc-message".bytes(), percent_encode(st.message.bytes()))) }
+    if st.details.len() > 0 { hs.push(http.Header("grpc-status-details-bin".bytes(), encoding.base64_encode(st.details, encoding.Standard, false).bytes())) }
+    for f in metadata_fields(trailers) { hs.push(f) }
+    hs
+}
+
+/// Ends a call that has not sent its head: headers only, with the status ("trailers-only").
+fn trailers_only(s: h2.Stream, st: def.Status, ctx: def.Ctx) uses io, clock {
+    let mut hs = head_fields(ctx.headers_out())
+    for f in status_fields(st, ctx.trailers_out()) { hs.push(f) }
+    let z = s.send_headers(hs, true)
+}
+
+/// Serves one gRPC stream (its head is already known to be gRPC).
+fn serve_stream(services: List[def.Service], max_recv: usize, s: h2.Stream, head: List[http.Header]) uses io, clock {
+    let path = http.find_s(head, ":path").unwrap_or(List.new())
+    let blank = def.ctx(String.from(""), List.new(), time.never(), String.from(""))
+    // /<service>/<method>
+    let mut svc_name: List[u8] = List.new()
+    let mut m_name: List[u8] = List.new()
+    if path.len() > 1 && path[0] == 47 {
+        match bytes.rfind_byte(path, 47) {
+            Some(i) => {
+                if i > 0 {
+                    svc_name = path.slice(1, i)
+                    m_name = path.slice(i + 1, path.len())
+                }
+            }
+            None => {}
+        }
+    }
+    let mut found: Option[def.Method] = None
+    for sv in services {
+        if bytes.eq(sv.name.bytes(), svc_name) { found = sv.find(m_name) }
+    }
+    let method = match found {
+        Some(m) => m
+        None => {
+            trailers_only(s, def.status(def.UNIMPLEMENTED, "unknown service or method"), blank)
+            s.release()
+            return
+        }
+    }
+    match http.find_s(head, "grpc-encoding") {
+        Some(enc) => {
+            if !http.eq_s(enc, "identity") {
+                trailers_only(s, def.status(def.UNIMPLEMENTED, "unsupported grpc-encoding (identity only)"), blank)
+                return
+            }
+        }
+        None => {}
+    }
+    let mut dl = time.never()
+    match http.find_s(head, "grpc-timeout") {
+        Some(t) => {
+            match parse_timeout(t) {
+                Some(ns) => { dl = time.after(time.nanos(ns)) }
+                None => {
+                    trailers_only(s, def.status(def.INTERNAL, "a bad grpc-timeout"), blank)
+                    return
+                }
+            }
+        }
+        None => {}
+    }
+    let mut name = String.from("/")
+    name.append(String.from_bytes(svc_name.copy()).unwrap_or(String.from("")))
+    name.push_str("/")
+    name.append(String.from_bytes(m_name.copy()).unwrap_or(String.from("")))
+    let ctx = def.ctx(name, metadata_of(head), dl, String.from(""))
+    let rd = sync.lock(Reader(s, List.new(), max_recv, false))
+    let sent = sync.lock(false)
+    let rawin = def.RawIn(|| -> Result[Option[List[u8]], def.Status] {
+        rd.modify(|inout r: Reader| -> Result[Option[List[u8]], def.Status] { next_msg(inout r, dl) })
+    })
+    let rawout = def.RawOut(|b: List[u8]| -> Result[(), def.Status] {
+        let first = sent.modify(|inout f: bool| -> bool {
+            let was = f
+            f = true
+            !was
+        })
+        if first {
+            match s.send_headers(head_fields(ctx.headers_out()), false) {
+                Ok(z) => {}
+                Err(e) => { return Err(from_h2(e)) }
+            }
+        }
+        match s.send(frame(b), false, dl) {
+            Ok(z) => Ok(())
+            Err(e) => Err(from_h2(e))
+        }
+    })
+    let run = method.run
+    let result = task.catch(|| -> Result[(), def.Status] { run(ctx, rawin, rawout) })
+    let mut st = def.ok()
+    match result {
+        Ok(r) => {
+            match r {
+                Ok(z) => {}
+                Err(e) => { st = e }
+            }
+        }
+        Err(why) => { st = def.status(def.INTERNAL, "the handler failed") }
+    }
+    if st.code == def.OK && dl.expired() { st = def.status(def.DEADLINE_EXCEEDED, "the deadline passed") }
+    let head_sent = sent.get()
+    if head_sent {
+        let z = s.send_trailers(status_fields(st, ctx.trailers_out()))
+    } else {
+        trailers_only(s, st, ctx)
+    }
+    s.release()
+}
+
+/// A stream handler for `h2.serve` that serves `services` over gRPC (`max_recv`: the largest request message, 4 MiB by
+/// default in `handler`); a stream that is not gRPC is answered with `415`.
+pub fn handler_with(services: List[def.Service], max_recv: usize) -> h2.StreamHandler uses io, clock {
+    |s: h2.Stream| -> () {
+        let head = match s.headers(time.never()) {
+            Ok(h) => h
+            Err(e) => { return }
+        }
+        if is_grpc(head) {
+            serve_stream(services, max_recv, s, head)
+        } else {
+            let mut r: List[http.Header] = List.new()
+            r.push(http.Header(":status".bytes(), "415".bytes()))
+            let z = s.send_headers(r, true)
+        }
+    }
+}
+
+pub fn handler(services: List[def.Service]) -> h2.StreamHandler uses io, clock { handler_with(services, 4194304) }
+
+/// A layer for `server.Config.h2_wrap`: gRPC streams are served here, everything else goes to the ordinary HTTP handler.
+pub fn middleware(services: List[def.Service]) -> h2.Middleware uses io, clock {
+    |next: h2.StreamHandler| -> h2.StreamHandler {
+        |s: h2.Stream| -> () {
+            let head = match s.headers(time.never()) {
+                Ok(h) => h
+                Err(e) => { return }
+            }
+            if is_grpc(head) {
+                serve_stream(services, 4194304, s, head)
+            } else {
+                next(s)
+            }
+        }
+    }
+}
+
+// ---- the client ----
+
+/// A connection to a gRPC server: an `h2.Client` and what every call puts in its head.
+pub type Channel = { c: h2.Client, authority: List[u8], scheme: List[u8], user_agent: List[u8], max_recv: usize }
+
+/// A channel over `c` (`h2.dial`, `secure.connect_h2`, or `h2.connect` over any duplex); `authority` is the `:authority`
+/// of every call (`host:port`). The scheme is the client's (`http` or `https`).
+pub fn channel(c: h2.Client, authority: str) -> Channel {
+    Channel(c, authority.bytes(), c.scheme.copy(), "eider-grpc/0.7".bytes(), 4194304)
+}
+
+/// Per-call settings: the timeout (sent as `grpc-timeout`, and the client gives up at it: `DEADLINE_EXCEEDED`) and the request
+/// metadata (`-bin` keys carry bytes).
+pub type CallOpts = { timeout: Option[time.Duration], metadata: List[http.Header] }
+
+pub fn call_opts() -> CallOpts { CallOpts(None, List.new()) }
+
+impl CallOpts {
+    fn with_timeout(self, d: time.Duration) -> CallOpts { CallOpts(Some(d), self.metadata.copy()) }
+
+    fn with_metadata(self, key: str, value: List[u8]) -> CallOpts {
+        let mut m = self.metadata.copy()
+        m.push(http.Header(key.bytes(), value))
+        CallOpts(self.timeout, m)
+    }
+}
+
+/// A call in progress, as bytes. What a response head and trailers say about the status is read once and kept.
+type Raw = { st: h2.Stream, rd: sync.Lock[Reader], dl: time.Deadline, state: sync.Lock[Seen] }
+
+type Seen = { head: bool, final: Option[def.Status], head_md: List[http.Header], trailer_md: List[http.Header] }
+
+fn start(ch: Channel, method: str, o: CallOpts) -> Result[Raw, def.Status] uses io, clock {
+    let mut dl = time.never()
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(":method".bytes(), "POST".bytes()))
+    hs.push(http.Header(":scheme".bytes(), ch.scheme.copy()))
+    hs.push(http.Header(":path".bytes(), method.bytes()))
+    hs.push(http.Header(":authority".bytes(), ch.authority.copy()))
+    hs.push(http.Header("content-type".bytes(), content_type()))
+    hs.push(http.Header("te".bytes(), "trailers".bytes()))
+    hs.push(http.Header("user-agent".bytes(), ch.user_agent.copy()))
+    hs.push(http.Header("grpc-accept-encoding".bytes(), "identity".bytes()))
+    match o.timeout {
+        Some(d) => {
+            dl = time.after(d)
+            hs.push(http.Header("grpc-timeout".bytes(), format_timeout(d.ns)))
+        }
+        None => {}
+    }
+    for f in metadata_fields(o.metadata) { hs.push(f) }
+    match ch.c.open(hs, false, dl) {
+        Ok(st) => {
+            let rd = sync.lock(Reader(st, List.new(), ch.max_recv, false))
+            Ok(Raw(st, rd, dl, sync.lock(Seen(false, None, List.new(), List.new()))))
+        }
+        Err(e) => Err(from_h2(e))
+    }
+}
+
+/// The status in a header block (the response head of a trailers-only call, or the trailers).
+fn status_in(hs: List[http.Header]) -> Option[def.Status] {
+    match http.find_s(hs, "grpc-status") {
+        Some(v) => {
+            let code = match bytes.parse_u64(v) {
+                Some(n) => n as i32
+                None => def.UNKNOWN
+            }
+            let msg = match http.find_s(hs, "grpc-message") {
+                Some(m) => String.from_bytes(percent_decode(m)).unwrap_or(String.from(""))
+                None => String.from("")
+            }
+            let details = match http.find_s(hs, "grpc-status-details-bin") {
+                Some(b) => encoding.base64_decode(b, encoding.Standard, encoding.Optional).unwrap_or(List.new())
+                None => List.new()
+            }
+            Some(def.Status(code, msg, details))
+        }
+        None => None
+    }
+}
+
+impl Raw {
+    fn send(self, msg: List[u8]) -> Result[(), def.Status] uses io, clock {
+        match self.st.send(frame(msg), false, self.dl) {
+            Ok(z) => Ok(())
+            Err(e) => Err(from_h2(e))
+        }
+    }
+
+    fn close_send(self) -> Result[(), def.Status] uses io, clock {
+        match self.st.finish() {
+            Ok(z) => Ok(())
+            Err(e) => Err(from_h2(e))
+        }
+    }
+
+    /// Waits for the response head and checks it: an HTTP error or a non-gRPC answer ends the call; a head that already
+    /// holds `grpc-status` is the whole answer.
+    fn head(self) -> Result[(), def.Status] uses io, clock {
+        let seen = self.state.get()
+        if seen.head { return Ok(()) }
+        let hs = match self.st.headers(self.dl) {
+            Ok(h) => h
+            Err(e) => { return Err(from_h2(e)) }
+        }
+        let code = http.find_s(hs, ":status").unwrap_or("0".bytes())
+        let n = bytes.parse_u64(code).unwrap_or(0) as i32
+        let md = metadata_of(hs)
+        let only = status_in(hs)
+        if n != 200 && only.is_none() {
+            let st = from_http(n)
+            self.state.modify(|inout s: Seen| -> () {
+                s.head = true
+                s.final = Some(st)
+            })
+            return Ok(())
+        }
+        if !is_grpc(hs) && only.is_none() {
+            let st = def.status(def.UNKNOWN, "the server did not answer with a gRPC content type")
+            self.state.modify(|inout s: Seen| -> () {
+                s.head = true
+                s.final = Some(st)
+            })
+            return Ok(())
+        }
+        self.state.modify(|inout s: Seen| -> () {
+            s.head = true
+            s.head_md = md
+            match only {
+                Some(st) => {
+                    s.final = Some(st)
+                    s.trailer_md = metadata_of(hs)
+                }
+                None => {}
+            }
+        })
+        Ok(())
+    }
+
+    /// The next response message; `Ok(None)` once the call ended with status OK; the call's status as `Err` otherwise.
+    fn recv(self) -> Result[Option[List[u8]], def.Status] uses io, clock {
+        self.head()?
+        let seen = self.state.get()
+        match seen.final {
+            Some(st) => {
+                if st.code == def.OK { return Ok(None) }
+                return Err(st)
+            }
+            None => {}
+        }
+        let dl = self.dl
+        let got = self.rd.modify(|inout r: Reader| -> Result[Option[List[u8]], def.Status] { next_msg(inout r, dl) })
+        match got? {
+            Some(m) => { return Ok(Some(m)) }
+            None => {}
+        }
+        // the end of the data: the trailers say how the call went
+        let tr = self.st.trailers()
+        let st = match tr {
+            Some(t) => {
+                match status_in(t) {
+                    Some(x) => x
+                    None => def.status(def.UNKNOWN, "the call ended without a grpc-status")
+                }
+            }
+            None => def.status(def.UNKNOWN, "the call ended without a grpc-status")
+        }
+        let tmd = match tr {
+            Some(t) => metadata_of(t)
+            None => List.new()
+        }
+        self.state.modify(|inout s: Seen| -> () {
+            s.final = Some(st)
+            s.trailer_md = tmd
+        })
+        if st.code == def.OK { return Ok(None) }
+        Err(st)
+    }
+
+    /// Gives up on the call (RST_STREAM CANCEL).
+    fn cancel(self) uses io, clock { self.st.reset(h2frame.CANCEL) }
+
+    /// Lets go of the stream (what is unfinished is reset).
+    fn done(self) uses io, clock { self.st.release() }
+}
+
+/// A server-streaming, client-streaming or bidirectional call in progress, with typed messages.
+pub type Call[Q, R] = { raw: Raw, qc: def.Codec[Q], rc: def.Codec[R] }
+
+impl[Q, R] Call[Q, R] {
+    /// Sends a request message.
+    fn send(self, q: Q) -> Result[(), def.Status] uses io, clock {
+        let e = self.qc.enc
+        match e(q) {
+            Ok(b) => self.raw.send(b)
+            Err(why) => Err(def.status_text(def.INTERNAL, why))
+        }
+    }
+
+    /// Says no more requests are coming.
+    fn close_send(self) -> Result[(), def.Status] uses io, clock { self.raw.close_send() }
+
+    /// The next response message, `Ok(None)` at the end of a call that succeeded, the status of one that failed.
+    fn recv(self) -> Result[Option[R], def.Status] uses io, clock {
+        match self.raw.recv()? {
+            Some(b) => {
+                let d = self.rc.dec
+                match d(b) {
+                    Ok(r) => Ok(Some(r))
+                    Err(why) => Err(def.status_text(def.INTERNAL, why))
+                }
+            }
+            None => Ok(None)
+        }
+    }
+
+    /// For a client-streaming call: closes the request stream and returns the one response.
+    fn close_and_recv(self) -> Result[R, def.Status] uses io, clock {
+        self.close_send()?
+        let first = self.recv()?
+        let r = match first {
+            Some(x) => x
+            None => { return Err(def.status(def.INTERNAL, "the call returned no message")) }
+        }
+        match self.raw.recv() {
+            Ok(more) => {
+                if more.is_some() { return Err(def.status(def.INTERNAL, "the call returned more than one message")) }
+            }
+            Err(st) => { return Err(st) }
+        }
+        Ok(r)
+    }
+
+    /// The metadata the server sent with the response head, and its trailers (once the call ended).
+    fn header_metadata(self) -> List[http.Header] { self.raw.state.get().head_md }
+    fn trailer_metadata(self) -> List[http.Header] { self.raw.state.get().trailer_md }
+
+    fn cancel(self) uses io, clock { self.raw.cancel() }
+
+    /// Releases the call's stream; call it when finished with it.
+    fn done(self) uses io, clock { self.raw.done() }
+}
+
+fn open_call[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], o: CallOpts) -> Result[Call[Q, R], def.Status] uses io, clock {
+    let raw = start(ch, method, o)?
+    Ok(Call(raw, qc, rc))
+}
+
+/// A unary call: `method` is `/pkg.Service/Method`.
+pub fn unary[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], req: Q, o: CallOpts) -> Result[R, def.Status] uses io, clock {
+    let call = open_call(ch, method, qc, rc, o)?
+    let r = unary_on(call, req)
+    call.done()
+    r
+}
+
+fn unary_on[Q, R](call: Call[Q, R], req: Q) -> Result[R, def.Status] uses io, clock {
+    call.send(req)?
+    call.close_and_recv()
+}
+
+/// A server-streaming call: one request, then `recv` until `Ok(None)`.
+pub fn server_stream[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], req: Q, o: CallOpts) -> Result[Call[Q, R], def.Status] uses io, clock {
+    let call = open_call(ch, method, qc, rc, o)?
+    match call.send(req) {
+        Ok(z) => {}
+        Err(st) => {
+            call.done()
+            return Err(st)
+        }
+    }
+    match call.close_send() {
+        Ok(z) => {}
+        Err(st) => {
+            call.done()
+            return Err(st)
+        }
+    }
+    Ok(call)
+}
+
+/// A client-streaming call: `send` requests, then `close_and_recv` for the response.
+pub fn client_stream[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], o: CallOpts) -> Result[Call[Q, R], def.Status] uses io, clock {
+    open_call(ch, method, qc, rc, o)
+}
+
+/// A bidirectional call: `send` and `recv` in any interleaving, `close_send` when done sending.
+pub fn bidi[Q, R](ch: Channel, method: str, qc: def.Codec[Q], rc: def.Codec[R], o: CallOpts) -> Result[Call[Q, R], def.Status] uses io, clock {
+    open_call(ch, method, qc, rc, o)
+}

@@ -1,0 +1,138 @@
+// gRPC over a connection that began as HTTP/1.1 and was upgraded (`Connection: Upgrade`, `Upgrade: h2c`): the two endpoints of
+// Docker's BuildKit API, played here by Eider on both sides.
+//
+//   /grpc     the daemon is the gRPC server (BuildKit's Control service) and the Docker CLI the client;
+//   /session  the CLI made the HTTP request but then SERVES gRPC (file sync, auth, secrets), and the daemon is the gRPC
+//             client, calling back into the CLI over that same connection.
+//
+// The daemon is an eider-http server; the CLI is plain sockets, http/h2 and rpc/grpc.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.task
+import std.time
+import http
+import http.h2
+import http.router
+import http.server
+import http.transport
+import rpc.def
+import rpc.grpc
+import rpc.tests.demo.demo as pb
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn hello(n: String) -> pb.HelloRequest { pb.HelloRequest(n, empty()) }
+
+fn upgrade(fdn: i32, path: str) -> Result[List[u8], String] uses net, io, clock {
+    let t = transport.plain(fdn)
+    let mut req = String.from("POST ")
+    req.push_str(path)
+    req.push_str(" HTTP/1.1\r\nHost: daemon\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nContent-Length: 0\r\n\r\n")
+    if !t.send_by(req.bytes(), time.after(time.seconds(5))) { return Err(String.from("send failed")) }
+    let mut got: List[u8] = List.new()
+    while true {
+        match bytes.find(got, "\r\n\r\n".bytes(), 0) {
+            Some(i) => { return Ok(got.slice(i + 4, got.len())) }
+            None => {}
+        }
+        match t.read_by(4096, time.after(time.seconds(5)))? {
+            Some(b) => {
+                if b.len() == 0 { return Err(String.from("closed")) }
+                got.extend(b)
+            }
+            None => { return Err(String.from("timed out")) }
+        }
+    }
+    Err(String.from("unreachable"))
+}
+
+fn dial(port: i32) -> i32 uses net, io, clock {
+    let s = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    let ok = net.connect(s, net.ipv4(127, 0, 0, 1, port)).unwrap()
+    let z = fd.set_nonblocking(s, true)
+    s
+}
+
+fn main() uses net, io, clock, threads {
+    let reg = pb.registry()
+    let hq = def.codec[pb.HelloRequest](reg, "demo.HelloRequest")
+    let hr = def.codec[pb.HelloReply](reg, "demo.HelloReply")
+    let nc = def.codec[pb.Num](reg, "demo.Num")
+    let svcs = List[greeter.service()]
+    let tok = task.root()
+    let mut r = router.new()
+    // /grpc: the daemon serves the service over the hijacked connection
+    r.post("/grpc", |q: http.Request| -> http.Response { h2.accept_server(q, h2.options(), grpc.handler(svcs)) })
+    // /session: the daemon is the gRPC client of whatever the CLI serves
+    r.post("/session", |q: http.Request| -> http.Response {
+        h2.accept_client(q, h2.options(), |c: h2.Client| -> () {
+            let ch = grpc.channel(c, "cli")
+            for who in List["auth", "filesync"] {
+                match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello(String.from(who)), grpc.call_opts()) {
+                    Ok(x) => { say(String.from("daemon got a reply")) }
+                    Err(st) => { say(String.from("daemon call failed")) }
+                }
+            }
+            let bc = grpc.bidi(ch, "/demo.Greeter/Chat", hq, hr, grpc.call_opts()).unwrap()
+            let z = bc.send(hello(String.from("stream")))
+            match bc.recv() {
+                Ok(Some(x)) => { say(String.from("daemon chat reply")) }
+                _ => { say(String.from("daemon chat failed")) }
+            }
+            let zc = bc.close_send()
+            let rest = bc.recv()
+            bc.done()
+        })
+    })
+    let mut cfg = server.config()
+    cfg.h2 = Some(h2.options())
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let port = srv.port()
+    let h = router.handler(r)
+    let st = tok
+    let t = spawn(|| -> i32 {
+        let z = srv.serve(h, st)
+        0
+    })
+    say(String.from("-- /grpc: the CLI is the gRPC client of the daemon"))
+    let c1 = dial(port)
+    let left = upgrade(c1, "/grpc").unwrap()
+    let cli = h2.connect(h2.wire_with_prefix(h2.wire_of_transport(transport.plain(c1)), left), h2.options()).unwrap()
+    let ch = grpc.channel(cli, "daemon")
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello(String.from("docker")), grpc.call_opts()) {
+        Ok(x) => { say(x.message.copy()) }
+        Err(st2) => { say(String.from("failed")) }
+    }
+    let sc = grpc.server_stream(ch, "/demo.Greeter/Count", nc, nc, pb.Num(3, empty()), grpc.call_opts()).unwrap()
+    let mut got = String.from("")
+    while true {
+        match sc.recv() {
+            Ok(Some(n)) => {
+                got.append(n.n.to_string())
+                got.push_str(" ")
+            }
+            _ => { break }
+        }
+    }
+    say(got)
+    sc.done()
+    cli.close()
+
+    say(String.from("-- /session: the CLI serves gRPC, the daemon is the client"))
+    let c2 = dial(port)
+    let left2 = upgrade(c2, "/session").unwrap()
+    let wire2 = h2.wire_with_prefix(h2.wire_of_transport(transport.plain(c2)), left2)
+    let z2 = h2.serve(wire2, h2.options(), grpc.handler(svcs))
+    say(String.from("the CLI's connection ended"))
+    say(String.from("done"))
+    tok.cancel()
+    let z7 = t.join()
+}

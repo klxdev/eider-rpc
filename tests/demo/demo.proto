@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package demo;
+
+message HelloRequest { string name = 1; }
+message HelloReply { string message = 1; }
+message Num { int64 n = 1; }
+
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  rpc Fail(HelloRequest) returns (HelloReply);
+  rpc Meta(HelloRequest) returns (HelloReply);
+  rpc Slow(Num) returns (Num);
+  rpc Count(Num) returns (stream Num);
+  rpc Sum(stream Num) returns (Num);
+  rpc Chat(stream HelloRequest) returns (stream HelloReply);
+}

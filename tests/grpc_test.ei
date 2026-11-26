@@ -1,0 +1,211 @@
+// gRPC end to end, all in Eider: a server (rpc/grpc over http/h2) and a client on a socket pair, one method of each kind
+// (unary, server-, client- and bidirectional streaming), error statuses and their trailers, metadata (`-bin` too),
+// deadlines, cancellation, an unknown method, messages over the limit; then the same service over Connect and JSON-RPC.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.task
+import std.time
+import http
+import http.h2
+import http.transport
+import json
+import rpc.def
+import rpc.grpc
+import rpc.connect
+import rpc.jsonrpc
+import rpc.tests.demo.demo as pb
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+fn cat(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn hello(n: str) -> pb.HelloRequest { pb.HelloRequest(String.from(n), empty()) }
+
+fn num(n: i64) -> pb.Num { pb.Num(n, empty()) }
+
+fn show(st: def.Status) -> String {
+    let mut l = def.code_name(st.code)
+    if st.message.len() > 0 {
+        l.push_str(": ")
+        l.append(st.message.copy())
+    }
+    l
+}
+
+fn main() uses net, io, clock, threads {
+    let reg = pb.registry()
+    let hq = def.codec[pb.HelloRequest](reg, "demo.HelloRequest")
+    let hr = def.codec[pb.HelloReply](reg, "demo.HelloReply")
+    let nc = def.codec[pb.Num](reg, "demo.Num")
+    let svcs = List[greeter.service()]
+
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let srv = spawn(|| -> i32 {
+        let z = h2.serve(sw, h2.options(), grpc.handler(svcs))
+        0
+    })
+    let cl = h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()).unwrap()
+    let ch = grpc.channel(cl, "test")
+    let o = grpc.call_opts()
+
+    say(String.from("-- unary"))
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello("world"), o) {
+        Ok(r) => { say(r.message.copy()) }
+        Err(st) => { say(show(st)) }
+    }
+
+    say(String.from("-- an error status, with its message and trailer"))
+    match grpc.unary(ch, "/demo.Greeter/Fail", hq, hr, hello("bob"), o) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+
+    say(String.from("-- an unknown method and an unknown service"))
+    match grpc.unary(ch, "/demo.Greeter/Nope", hq, hr, hello("x"), o) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+    match grpc.unary(ch, "/other.Svc/SayHello", hq, hr, hello("x"), o) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+
+    say(String.from("-- metadata in and out, a binary value"))
+    let mo = o.with_metadata("x-token", "abc".bytes()).with_metadata("x-raw-bin", List[0 as u8, 255, 1, 2])
+    let mc = grpc.bidi(ch, "/demo.Greeter/Meta", hq, hr, mo).unwrap()
+    let zz = mc.send(hello("m"))
+    let zc = mc.close_send()
+    match mc.recv() {
+        Ok(Some(r)) => { say(r.message.copy()) }
+        Ok(None) => { say(String.from("no message")) }
+        Err(st) => { say(show(st)) }
+    }
+    let fin = mc.recv()
+    say(String.from(if fin.is_ok() { "ended ok" } else { "ended with an error" }))
+    say(cat("response header x-seen=", sys.to_string(http.find_s(mc.header_metadata(), "x-seen").unwrap_or("-".bytes()))))
+    say(cat("trailer x-done=", sys.to_string(http.find_s(mc.trailer_metadata(), "x-done").unwrap_or("-".bytes()))))
+    mc.done()
+
+    say(String.from("-- server streaming"))
+    let sc = grpc.server_stream(ch, "/demo.Greeter/Count", nc, nc, num(5), o).unwrap()
+    let mut got = String.from("")
+    while true {
+        match sc.recv() {
+            Ok(Some(n)) => {
+                got.append(n.n.to_string())
+                got.push_str(" ")
+            }
+            Ok(None) => { break }
+            Err(st) => {
+                got.append(show(st))
+                break
+            }
+        }
+    }
+    say(got)
+    sc.done()
+
+    say(String.from("-- client streaming"))
+    let cc = grpc.client_stream(ch, "/demo.Greeter/Sum", nc, nc, o).unwrap()
+    for i in 1..101 { let z = cc.send(num(i as i64)) }
+    match cc.close_and_recv() {
+        Ok(r) => { say(cat("sum=", r.n.to_string())) }
+        Err(st) => { say(show(st)) }
+    }
+    cc.done()
+
+    say(String.from("-- bidirectional: each message is answered before the next is sent"))
+    let bc = grpc.bidi(ch, "/demo.Greeter/Chat", hq, hr, o).unwrap()
+    for w in List["one", "two", "three"] {
+        let z = bc.send(hello(w))
+        match bc.recv() {
+            Ok(Some(r)) => { say(r.message.copy()) }
+            Ok(None) => { say(String.from("ended")) }
+            Err(st) => { say(show(st)) }
+        }
+    }
+    let z3 = bc.close_send()
+    match bc.recv() {
+        Ok(None) => { say(String.from("stream ended ok")) }
+        Ok(Some(r)) => { say(String.from("extra message")) }
+        Err(st) => { say(show(st)) }
+    }
+    bc.done()
+
+    say(String.from("-- a deadline shorter than the work"))
+    let dlo = o.with_timeout(time.millis(150))
+    match grpc.unary(ch, "/demo.Greeter/Slow", nc, nc, num(2000), dlo) {
+        Ok(r) => { say(String.from("unexpected success")) }
+        Err(st) => { say(show(st)) }
+    }
+    say(String.from("-- and one that is long enough"))
+    match grpc.unary(ch, "/demo.Greeter/Slow", nc, nc, num(20), o.with_timeout(time.seconds(5))) {
+        Ok(r) => { say(cat("done in time: ", r.n.to_string())) }
+        Err(st) => { say(show(st)) }
+    }
+
+    say(String.from("-- the client cancels a call"))
+    let cn = grpc.bidi(ch, "/demo.Greeter/Chat", hq, hr, o).unwrap()
+    let z4 = cn.send(hello("a"))
+    let r4 = cn.recv()
+    cn.cancel()
+    match cn.recv() {
+        Ok(x) => { say(String.from("still receiving")) }
+        Err(st) => { say(show(st)) }
+    }
+    cn.done()
+
+    say(String.from("-- the connection is still good after all that"))
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello("again"), o) {
+        Ok(r) => { say(r.message.copy()) }
+        Err(st) => { say(show(st)) }
+    }
+
+    say(String.from("-- the same service over Connect (JSON and protobuf bodies) and JSON-RPC"))
+    let ch2 = connect.handler(svcs)
+    let mut rq = http.request("POST", "/demo.Greeter/SayHello".bytes())
+    rq.set_header("Content-Type", "application/json".bytes())
+    rq.body = "{{\"name\":\"json\"}}".bytes()
+    let rs = ch2(rq)
+    say(cat("connect json: ", rs.status.to_string()))
+    say(sys.to_string(rs.body))
+    let mut rq2 = http.request("POST", "/demo.Greeter/SayHello".bytes())
+    rq2.set_header("Content-Type", "application/proto".bytes())
+    rq2.body = hq.enc(hello("proto")).unwrap()
+    let rs2 = ch2(rq2)
+    say(cat("connect proto: ", rs2.status.to_string()))
+    say(hr.dec(rs2.body).unwrap().message.copy())
+    let mut rq3 = http.request("POST", "/demo.Greeter/Fail".bytes())
+    rq3.set_header("Content-Type", "application/json".bytes())
+    rq3.body = "{{\"name\":\"z\"}}".bytes()
+    let rs3 = ch2(rq3)
+    say(cat("connect error: ", rs3.status.to_string()))
+    say(sys.to_string(rs3.body))
+    let mut rq4 = http.request("POST", "/demo.Greeter/Count".bytes())
+    rq4.set_header("Content-Type", "application/json".bytes())
+    rq4.body = "{{\"n\":3}}".bytes()
+    say(cat("connect streaming method: ", ch2(rq4).status.to_string()))
+    let mut tbl = jsonrpc.table()
+    def.mount_jsonrpc(inout tbl, svcs[0].copy())
+    say(sys.to_string(tbl.handle("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"demo.Greeter.SayHello\",\"params\":{{\"name\":\"rpc\"}}}}".bytes()).unwrap()))
+    say(sys.to_string(tbl.handle("{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"demo.Greeter.Fail\",\"params\":{{\"name\":\"rpc\"}}}}".bytes()).unwrap()))
+
+    cl.close()
+    let z5 = srv.join()
+    say(String.from("done"))
+}

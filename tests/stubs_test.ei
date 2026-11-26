@@ -1,0 +1,104 @@
+// The generated service stubs (tests/demo2/demo_grpc.ei, from tests/demo/demo.proto by examples/protoc_grpc): a server built from a
+// handlers record and a typed client, on a socket pair, one rpc of each kind.
+
+import core.sys
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.task
+import std.time
+import http.h2
+import http.transport
+import rpc.def
+import rpc.grpc
+import rpc.tests.demo2.demo
+import rpc.tests.demo2.demo_grpc as stubs
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn main() uses net, io, clock, threads {
+    let reg = demo.registry()
+    let handlers = stubs.GreeterHandlers(
+        |c: def.Ctx, q: demo.HelloRequest| -> Result[demo.HelloReply, def.Status] {
+            let mut m = String.from("hi ")
+            m.append(q.name.copy())
+            Ok(demo.HelloReply(m, empty()))
+        },
+        |c: def.Ctx, q: demo.HelloRequest| -> Result[demo.HelloReply, def.Status] { Err(def.status(def.PERMISSION_DENIED, "nope")) },
+        |c: def.Ctx, q: demo.HelloRequest| -> Result[demo.HelloReply, def.Status] { Ok(demo.HelloReply(String.from("meta"), empty())) },
+        |c: def.Ctx, q: demo.Num| -> Result[demo.Num, def.Status] { Ok(q) },
+        |c: def.Ctx, q: demo.Num, out: def.Out[demo.Num]| -> Result[(), def.Status] {
+            out.send(demo.Num(q.n * 10, empty()))?
+            out.send(demo.Num(q.n * 100, empty()))
+        },
+        |c: def.Ctx, inp: def.In[demo.Num]| -> Result[demo.Num, def.Status] {
+            let mut t: i64 = 0
+            while true {
+                match inp.recv()? {
+                    Some(n) => { t += n.n }
+                    None => { break }
+                }
+            }
+            Ok(demo.Num(t, empty()))
+        },
+        |c: def.Ctx, inp: def.In[demo.HelloRequest], out: def.Out[demo.HelloReply]| -> Result[(), def.Status] {
+            while true {
+                match inp.recv()? {
+                    Some(m) => { out.send(demo.HelloReply(m.name.copy(), empty()))? }
+                    None => { break }
+                }
+            }
+            Ok(())
+        })
+    let svcs = List[stubs.greeter_service(reg, handlers)]
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let srv = spawn(|| -> i32 {
+        let z = h2.serve(sw, h2.options(), grpc.handler(svcs))
+        0
+    })
+    let cl = h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()).unwrap()
+    let c = stubs.greeter_client(grpc.channel(cl, "t"), reg)
+    let o = grpc.call_opts()
+
+    match c.say_hello(demo.HelloRequest(String.from("stubs"), empty()), o) {
+        Ok(r) => { say(r.message.copy()) }
+        Err(st) => { say(def.code_name(st.code)) }
+    }
+    match c.fail(demo.HelloRequest(String.from("x"), empty()), o) {
+        Ok(r) => { say(String.from("unexpected")) }
+        Err(st) => { say(def.code_name(st.code)) }
+    }
+    let sc = c.count(demo.Num(7, empty()), o).unwrap()
+    while true {
+        match sc.recv() {
+            Ok(Some(n)) => { say(n.n.to_string()) }
+            _ => { break }
+        }
+    }
+    sc.done()
+    let cs = c.sum(o).unwrap()
+    for i in 1..5 { let z = cs.send(demo.Num(i as i64, empty())) }
+    match cs.close_and_recv() {
+        Ok(r) => { say(r.n.to_string()) }
+        Err(st) => { say(def.code_name(st.code)) }
+    }
+    cs.done()
+    let ch = c.chat(o).unwrap()
+    let z3 = ch.send(demo.HelloRequest(String.from("ping"), empty()))
+    match ch.recv() {
+        Ok(Some(r)) => { say(r.message.copy()) }
+        _ => { say(String.from("no reply")) }
+    }
+    let z4 = ch.close_send()
+    let z5 = ch.recv()
+    ch.done()
+    cl.close()
+    let z6 = srv.join()
+    say(String.from("done"))
+}

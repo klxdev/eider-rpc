@@ -18,3 +18,8 @@ uses = ["net", "io", "clock", "threads", "fs"]
 [deps.json]
 git = "https://github.com/klxdev/eider-json.git"
 version = "0.7.0"
+
+# protobuf messages for gRPC and Connect (rpc/def, rpc/grpc, rpc/connect); pure, granted nothing
+[deps.proto]
+git = "https://github.com/klxdev/eider-proto.git"
+version = "0.7.0"

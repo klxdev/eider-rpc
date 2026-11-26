@@ -1,0 +1,75 @@
+//! The test service of tests/grpc_test.ei and tests/grpc_interop*: demo.Greeter, one method of each kind.
+
+import std.bytes
+import std.serial
+import std.time
+import rpc.def
+import rpc.tests.demo.demo as pb
+
+fn cat(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn blank(b: String) -> pb.HelloReply { pb.HelloReply(b, serial_bytes()) }
+
+fn serial_bytes() -> serial.Bytes { serial.Bytes(List.new()) }
+
+pub fn service() -> def.Service uses clock {
+    let reg = pb.registry()
+    let hq = def.codec[pb.HelloRequest](reg, "demo.HelloRequest")
+    let hr = def.codec[pb.HelloReply](reg, "demo.HelloReply")
+    let nc = def.codec[pb.Num](reg, "demo.Num")
+    def.service("demo.Greeter")
+        .unary("SayHello", hq, hr, |c: def.Ctx, q: pb.HelloRequest| -> Result[pb.HelloReply, def.Status] {
+            Ok(blank(cat("Hello, ", q.name.copy())))
+        })
+        .unary("Fail", hq, hr, |c: def.Ctx, q: pb.HelloRequest| -> Result[pb.HelloReply, def.Status] {
+            c.set_trailer("x-failed", "yes".bytes())
+            Err(def.status_text(def.NOT_FOUND, cat("no such user: ", q.name.copy())))
+        })
+        .unary("Meta", hq, hr, |c: def.Ctx, q: pb.HelloRequest| -> Result[pb.HelloReply, def.Status] {
+            let tok = c.get("x-token").unwrap_or("-".bytes())
+            let raw = c.get("x-raw-bin").unwrap_or(List.new())
+            c.set_header("x-seen", tok.copy())
+            c.set_trailer("x-done", "1".bytes())
+            let mut m = String.from("token=")
+            m.append(String.from_bytes(tok).unwrap_or(String.from("?")))
+            m.push_str(" raw=")
+            m.append(raw.len().to_string())
+            Ok(blank(m))
+        })
+        .unary("Slow", nc, nc, |c: def.Ctx, q: pb.Num| -> Result[pb.Num, def.Status] {
+            let end = time.after_ms(q.n)
+            while !end.expired() && !c.expired() { time.sleep_ms(5) }
+            Ok(q)
+        })
+        .server_stream("Count", nc, nc, |c: def.Ctx, q: pb.Num, out: def.Out[pb.Num]| -> Result[(), def.Status] {
+            let mut i: i64 = 1
+            while i <= q.n {
+                out.send(pb.Num(i, serial_bytes()))?
+                i += 1
+            }
+            Ok(())
+        })
+        .client_stream("Sum", nc, nc, |c: def.Ctx, inp: def.In[pb.Num]| -> Result[pb.Num, def.Status] {
+            let mut total: i64 = 0
+            while true {
+                match inp.recv()? {
+                    Some(n) => { total += n.n }
+                    None => { break }
+                }
+            }
+            Ok(pb.Num(total, serial_bytes()))
+        })
+        .bidi("Chat", hq, hr, |c: def.Ctx, inp: def.In[pb.HelloRequest], out: def.Out[pb.HelloReply]| -> Result[(), def.Status] {
+            while true {
+                match inp.recv()? {
+                    Some(m) => { out.send(blank(cat("echo: ", m.name.copy())))? }
+                    None => { break }
+                }
+            }
+            Ok(())
+        })
+}

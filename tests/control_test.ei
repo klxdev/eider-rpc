@@ -1,0 +1,116 @@
+// BuildKit's real Control service (api/services/control/control.proto and everything it imports, generated into
+// tests/buildkit/ by examples/protoc_grpc): a server with Info, Solve, Status (server streaming) and Session (the bidirectional
+// stream BuildKit tunnels its session over), and the generated client calling them over gRPC; the rest answer UNIMPLEMENTED.
+
+import core.sys
+import std.fd
+import std.io
+import std.net
+import std.serial
+import std.task
+import std.time
+import http.h2
+import http.transport
+import rpc.def
+import rpc.grpc
+import rpc.tests.buildkit.github_com_moby_buildkit_api_services_control_control as ctl
+import rpc.tests.buildkit.github_com_moby_buildkit_api_services_control_control_grpc as ctlg
+import rpc.tests.buildkit.github_com_moby_buildkit_api_types_worker as worker
+import rpc.tests.buildkit.google_protobuf_timestamp as ts
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+
+fn main() uses net, io, clock, threads {
+    let reg = ctl.registry()
+    let handlers = ctlg.ControlHandlers(
+        |c: def.Ctx, q: ctl.DiskUsageRequest| -> Result[ctl.DiskUsageResponse, def.Status] { Err(def.status(def.UNIMPLEMENTED, "disk_usage")) },
+        |c: def.Ctx, q: ctl.PruneRequest, out: def.Out[ctl.UsageRecord]| -> Result[(), def.Status] { Err(def.status(def.UNIMPLEMENTED, "prune")) },
+        |c: def.Ctx, q: ctl.SolveRequest| -> Result[ctl.SolveResponse, def.Status] {
+            let mut resp: Map[String, String] = Map.new()
+            resp.insert(String.from("containerimage.digest"), String.from("sha256:abc"))
+            resp.insert(String.from("ref"), q.ref_.copy())
+            Ok(ctl.SolveResponse(resp, empty()))
+        },
+        |c: def.Ctx, q: ctl.StatusRequest, out: def.Out[ctl.StatusResponse]| -> Result[(), def.Status] {
+            for i in 0..3 {
+                let started = ts.Timestamp(1700000000 + (i as i64), 5, empty())
+                let v = ctl.Vertex(String.from("sha256:v"), List.new(), String.from("step"), false, Some(started), None, String.from(""), None, empty())
+                out.send(ctl.StatusResponse(List[v], List.new(), List.new(), List.new(), empty()))?
+            }
+            Ok(())
+        },
+        |c: def.Ctx, inp: def.In[ctl.BytesMessage], out: def.Out[ctl.BytesMessage]| -> Result[(), def.Status] {
+            while true {
+                match inp.recv()? {
+                    Some(m) => { out.send(m)? }
+                    None => { break }
+                }
+            }
+            Ok(())
+        },
+        |c: def.Ctx, q: ctl.ListWorkersRequest| -> Result[ctl.ListWorkersResponse, def.Status] { Err(def.status(def.UNIMPLEMENTED, "list_workers")) },
+        |c: def.Ctx, q: ctl.InfoRequest| -> Result[ctl.InfoResponse, def.Status] {
+            let v = worker.BuildkitVersion(String.from("github.com/moby/buildkit"), String.from("v0.99.0"), String.from("abc123"), String.from("1.0"), empty())
+            Ok(ctl.InfoResponse(Some(v), empty()))
+        },
+        |c: def.Ctx, q: ctl.BuildHistoryRequest, out: def.Out[ctl.BuildHistoryEvent]| -> Result[(), def.Status] { Err(def.status(def.UNIMPLEMENTED, "history")) },
+        |c: def.Ctx, q: ctl.UpdateBuildHistoryRequest| -> Result[ctl.UpdateBuildHistoryResponse, def.Status] { Err(def.status(def.UNIMPLEMENTED, "update")) })
+    let svcs = List[ctlg.control_service(reg, handlers)]
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let srv = spawn(|| -> i32 {
+        let z = h2.serve(sw, h2.options(), grpc.handler(svcs))
+        0
+    })
+    let cl = h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()).unwrap()
+    let c = ctlg.control_client(grpc.channel(cl, "buildkitd"), reg)
+    let o = grpc.call_opts()
+
+    match c.info(ctl.InfoRequest(empty()), o) {
+        Ok(r) => {
+            let v = r.buildkit_version.unwrap()
+            say(v.package.copy())
+            say(v.version.copy())
+        }
+        Err(st) => { say(def.code_name(st.code)) }
+    }
+    let mut sreq = ctl.SolveRequest(String.from("ref-7"), None, String.from(""), Map.new(), String.from("sess"), String.from("dockerfile.v0"), Map.new(), None, List.new(), Map.new(), false, None, List.new(), false, String.from(""), 0, false, empty())
+    match c.solve(sreq, o) {
+        Ok(r) => {
+            say(r.exporter_response.get(String.from("ref")).unwrap())
+            say(r.exporter_response.get(String.from("containerimage.digest")).unwrap())
+        }
+        Err(st) => { say(def.code_name(st.code)) }
+    }
+    let sc = c.status(ctl.StatusRequest(String.from("ref-7"), empty()), o).unwrap()
+    while true {
+        match sc.recv() {
+            Ok(Some(r)) => {
+                let v = r.vertexes[0].copy()
+                say(v.started.unwrap().seconds.to_string())
+            }
+            _ => { break }
+        }
+    }
+    sc.done()
+    let ses = c.session(o).unwrap()
+    let z3 = ses.send(ctl.BytesMessage(serial.Bytes("tunnelled bytes".bytes()), empty()))
+    match ses.recv() {
+        Ok(Some(m)) => { say(sys.to_string(m.data.data.copy())) }
+        _ => { say(String.from("no reply")) }
+    }
+    let z4 = ses.close_send()
+    let z5 = ses.recv()
+    ses.done()
+    match c.list_workers(ctl.ListWorkersRequest(List.new(), empty()), o) {
+        Ok(r) => { say(String.from("unexpected")) }
+        Err(st) => { say(def.code_name(st.code)) }
+    }
+    cl.close()
+    let z6 = srv.join()
+    say(String.from("done"))
+}

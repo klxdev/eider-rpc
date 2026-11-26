@@ -1,0 +1,163 @@
+// The Eider gRPC client against another implementation's server (the Go server of tests/grpc_go/server, grpc-go):
+//   grpc_interop_client <port>
+// The same cases as the Go client runs against the Eider server. Prints `ok   <case>` or `FAIL <case>`; exits 1 on a failure.
+
+import core.sys
+import std.bytes
+import std.env
+import std.io
+import std.serial
+import std.task
+import std.time
+import http
+import http.h2
+import rpc.def
+import rpc.grpc
+import rpc.tests.demo.demo as pb
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+fn check(name: str, ok: bool) -> i32 uses io {
+    let mut l = String.from(if ok { "ok   " } else { "FAIL " })
+    l.push_str(name)
+    say(l)
+    if ok { 0 } else { 1 }
+}
+
+fn empty() -> serial.Bytes { serial.Bytes(List.new()) }
+fn hello(n: String) -> pb.HelloRequest { pb.HelloRequest(n, empty()) }
+fn num(n: i64) -> pb.Num { pb.Num(n, empty()) }
+
+fn main() uses net, io, clock, threads {
+    let port = bytes.parse_u64(env.args()[1].copy()).unwrap() as i32
+    let reg = pb.registry()
+    let hq = def.codec[pb.HelloRequest](reg, "demo.HelloRequest")
+    let hr = def.codec[pb.HelloReply](reg, "demo.HelloReply")
+    let nc = def.codec[pb.Num](reg, "demo.Num")
+    let cl = h2.dial("127.0.0.1", port, h2.options(), time.after(time.seconds(20))).unwrap()
+    let ch = grpc.channel(cl, "127.0.0.1")
+    let o = grpc.call_opts()
+    let mut bad = 0
+
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello(String.from("eider")), o) {
+        Ok(r) => { bad += check("unary SayHello", r.message == String.from("Hello, eider")) }
+        Err(st) => { bad += check("unary SayHello", false) }
+    }
+    match grpc.unary(ch, "/demo.Greeter/Fail", hq, hr, hello(String.from("bob")), o) {
+        Ok(r) => { bad += check("error status NOT_FOUND with message", false) }
+        Err(st) => { bad += check("error status NOT_FOUND with message", st.code == def.NOT_FOUND && st.message == String.from("no such user: bob")) }
+    }
+    match grpc.unary(ch, "/demo.Greeter/Nope", hq, hr, hello(String.from("x")), o) {
+        Ok(r) => { bad += check("unknown method is UNIMPLEMENTED", false) }
+        Err(st) => { bad += check("unknown method is UNIMPLEMENTED", st.code == def.UNIMPLEMENTED) }
+    }
+    let mo = o.with_metadata("x-token", "abc".bytes()).with_metadata("x-raw-bin", List[0 as u8, 255, 1, 2])
+    let mc = grpc.bidi(ch, "/demo.Greeter/Meta", hq, hr, mo).unwrap()
+    let z = mc.send(hello(String.from("m")))
+    let z2 = mc.close_send()
+    match mc.recv() {
+        Ok(Some(r)) => { bad += check("metadata in (text and -bin)", r.message == String.from("token=abc raw=4")) }
+        _ => { bad += check("metadata in (text and -bin)", false) }
+    }
+    let fin = mc.recv()
+    bad += check("metadata out (header and trailer)", fin.is_ok() && http.find_s(mc.header_metadata(), "x-seen").is_some() && http.find_s(mc.trailer_metadata(), "x-done").is_some())
+    mc.done()
+
+    match grpc.unary(ch, "/demo.Greeter/Slow", nc, nc, num(2000), o.with_timeout(time.millis(150))) {
+        Ok(r) => { bad += check("deadline: DEADLINE_EXCEEDED", false) }
+        Err(st) => { bad += check("deadline: DEADLINE_EXCEEDED", st.code == def.DEADLINE_EXCEEDED) }
+    }
+    match grpc.unary(ch, "/demo.Greeter/Slow", nc, nc, num(20), o.with_timeout(time.seconds(5))) {
+        Ok(r) => { bad += check("deadline long enough", true) }
+        Err(st) => { bad += check("deadline long enough", false) }
+    }
+
+    let sc = grpc.server_stream(ch, "/demo.Greeter/Count", nc, nc, num(5), o).unwrap()
+    let mut total: i64 = 0
+    let mut n = 0
+    let mut ended_ok = false
+    while true {
+        match sc.recv() {
+            Ok(Some(x)) => {
+                total += x.n
+                n += 1
+            }
+            Ok(None) => {
+                ended_ok = true
+                break
+            }
+            Err(st) => { break }
+        }
+    }
+    sc.done()
+    bad += check("server streaming Count", ended_ok && n == 5 && total == 15)
+
+    let cc = grpc.client_stream(ch, "/demo.Greeter/Sum", nc, nc, o).unwrap()
+    for i in 1..101 { let zz = cc.send(num(i as i64)) }
+    match cc.close_and_recv() {
+        Ok(r) => { bad += check("client streaming Sum", r.n == 5050) }
+        Err(st) => { bad += check("client streaming Sum", false) }
+    }
+    cc.done()
+
+    let bc = grpc.bidi(ch, "/demo.Greeter/Chat", hq, hr, o).unwrap()
+    let mut ok = true
+    for w in List["one", "two", "three"] {
+        let zs = bc.send(hello(String.from(w)))
+        match bc.recv() {
+            Ok(Some(r)) => {
+                let mut want = String.from("echo: ")
+                want.push_str(w)
+                if r.message != want { ok = false }
+            }
+            _ => { ok = false }
+        }
+    }
+    let zc = bc.close_send()
+    match bc.recv() {
+        Ok(None) => {}
+        _ => { ok = false }
+    }
+    bc.done()
+    bad += check("bidirectional Chat", ok)
+
+    let cn = grpc.bidi(ch, "/demo.Greeter/Chat", hq, hr, o).unwrap()
+    let za = cn.send(hello(String.from("a")))
+    let ra = cn.recv()
+    cn.cancel()
+    match cn.recv() {
+        Ok(x) => { bad += check("cancelled call is CANCELLED", false) }
+        Err(st) => { bad += check("cancelled call is CANCELLED", st.code == def.CANCELLED) }
+    }
+    cn.done()
+
+    let mut bigs = String.from("")
+    for i in 0..1048576 { bigs.push_str("x") }
+    match grpc.unary(ch, "/demo.Greeter/SayHello", hq, hr, hello(bigs.copy()), o) {
+        Ok(r) => { bad += check("1 MiB message", r.message.len() == 1048576 + 7) }
+        Err(st) => { bad += check("1 MiB message", false) }
+    }
+
+    let mut tasks: List[Task[i32]] = List.new()
+    for i in 0..30 {
+        let cc2 = ch
+        tasks.push(spawn(|| -> i32 {
+            let mut nm = String.from("n")
+            nm.append(i.to_string())
+            match grpc.unary(cc2, "/demo.Greeter/SayHello", hq, hr, hello(nm.copy()), o) {
+                Ok(r) => {
+                    let mut want = String.from("Hello, ")
+                    want.append(nm)
+                    if r.message == want { 0 } else { 1 }
+                }
+                Err(st) => 1
+            }
+        }))
+    }
+    let mut fails = 0
+    for t in tasks { fails += t.join() }
+    bad += check("30 concurrent calls", fails == 0)
+    cl.close()
+    if bad > 0 { env.exit(1) }
+}

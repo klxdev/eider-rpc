@@ -1,0 +1,9 @@
+-- /grpc: the CLI is the gRPC client of the daemon
+Hello, docker
+1 2 3 
+-- /session: the CLI serves gRPC, the daemon is the client
+daemon got a reply
+daemon got a reply
+daemon chat reply
+the CLI's connection ended
+done

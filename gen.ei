@@ -1,0 +1,223 @@
+//! rpc/gen: Eider source for the gRPC services of `.proto` files (parsed with eider-proto's `proto/parser`), next to the message
+//! modules that eider-proto's `proto/gen` writes from the same files. For each `service Control { ... }` a module
+//! `<proto module>_grpc` has:
+//!
+//! - `ControlHandlers`, a record with one function per rpc (`disk_usage: fn(def.Ctx, DiskUsageRequest) -> Result[DiskUsageResponse,
+//!   def.Status]`; a server-streaming rpc also takes a `def.Out[R]`, a client-streaming one a `def.In[Q]`, a bidirectional one both),
+//!   and `control_service(reg, handlers) -> def.Service`, which is what `grpc.handler` / `grpc.middleware` serve (and `connect.handler`
+//!   and `def.mount_jsonrpc` for its unary methods);
+//! - `ControlClient` and `control_client(channel, reg)`: one method per rpc, `disk_usage(req, opts)` returning the response (unary),
+//!   `prune(req, opts)` returning the `grpc.Call` to receive the stream from (server-streaming), `session(opts)` a `grpc.Call` to
+//!   send and receive on (client-streaming and bidirectional).
+//!
+//! `generate(files, options)` takes every file the services' files import (`proto/gen.load_all`), and the same `proto/pgen.Options` as the
+//! messages were generated with (their module names and import prefix).
+
+import std.bytes
+import std.strings
+import proto.parser
+import proto.gen as pgen
+
+/// A generated module: its name, file name and source.
+pub type Out = { modname: String, path: String, text: String }
+
+fn cat[T: strings.Text](a: String, b: T) -> String {
+    let mut l = a.copy()
+    l.append(b.text())
+    l
+}
+
+fn q(s: String) -> String { cat(cat(String.from("\""), s), "\"") }
+
+fn alias_of(mods: List[String], m: String) -> String {
+    for i in 0..mods.len() {
+        if mods[i] == m { return if i == 0 { String.from("pb") } else { cat(String.from("m"), i.to_string()) } }
+    }
+    m
+}
+
+fn type_in(tr: pgen.TypeRef, mods: List[String]) -> String { cat(cat(alias_of(mods, tr.modname.copy()), "."), tr.eider.copy()) }
+
+fn codec_of(tr: pgen.TypeRef, mods: List[String]) -> String {
+    let mut t = String.from("def.codec[")
+    t.append(type_in(tr.copy(), mods))
+    t.push_str("](reg, ")
+    t.append(q(tr.full.copy()))
+    t.push_str(")")
+    t
+}
+
+fn gen_file(f: parser.File, rs: pgen.Resolver, opt: pgen.Options) -> Result[Out, String] {
+    let own = rs.module_of_path(f.path.copy())
+    let name = cat(own.copy(), "_grpc")
+    let mut mods: List[String] = List.new()
+    mods.push(own.copy())
+    // the message modules the rpcs use (the file's own first: `pb`, the others `m1`, `m2`, ...)
+    for sv in f.services {
+        for r in sv.rpcs {
+            let a = rs.message(f.package.copy(), r.input.copy())?
+            let b = rs.message(f.package.copy(), r.output.copy())?
+            if !mods.contains(a.modname.copy()) { mods.push(a.modname.copy()) }
+            if !mods.contains(b.modname.copy()) { mods.push(b.modname.copy()) }
+        }
+    }
+    let mut body = String.from("")
+    for sv in f.services {
+        let mut handlers = String.from("")
+        let mut build = String.from("")
+        let mut client = String.from("")
+        let lower = pgen.snake_case(sv.name.copy())
+        let full = if f.package.len() > 0 { cat(cat(f.package.copy(), "."), sv.name.copy()) } else { sv.name.copy() }
+        for r in sv.rpcs {
+            let qt = rs.message(f.package.copy(), r.input.copy())?
+            let rt = rs.message(f.package.copy(), r.output.copy())?
+            let fname = pgen.snake_case(r.name.copy())
+            let qn = type_in(qt.copy(), mods.copy())
+            let rn = type_in(rt.copy(), mods.copy())
+            let path = cat(cat(cat(String.from("/"), full.copy()), "/"), r.name.copy())
+            // the handler field
+            handlers.push_str("    ")
+            handlers.append(fname.copy())
+            handlers.push_str(": fn(def.Ctx")
+            let mut kind = String.from("unary")
+            if !r.client_stream && !r.server_stream {
+                handlers.push_str(", ")
+                handlers.append(qn.copy())
+                handlers.push_str(") -> Result[")
+                handlers.append(rn.copy())
+                handlers.push_str(", def.Status],\n")
+            } else if !r.client_stream && r.server_stream {
+                kind = String.from("server_stream")
+                handlers.push_str(", ")
+                handlers.append(qn.copy())
+                handlers.push_str(", def.Out[")
+                handlers.append(rn.copy())
+                handlers.push_str("]) -> Result[(), def.Status],\n")
+            } else if r.client_stream && !r.server_stream {
+                kind = String.from("client_stream")
+                handlers.push_str(", def.In[")
+                handlers.append(qn.copy())
+                handlers.push_str("]) -> Result[")
+                handlers.append(rn.copy())
+                handlers.push_str(", def.Status],\n")
+            } else {
+                kind = String.from("bidi")
+                handlers.push_str(", def.In[")
+                handlers.append(qn.copy())
+                handlers.push_str("], def.Out[")
+                handlers.append(rn.copy())
+                handlers.push_str("]) -> Result[(), def.Status],\n")
+            }
+            // the service builder
+            build.push_str("        .")
+            build.append(kind.copy())
+            build.push_str("(")
+            build.append(q(r.name.copy()))
+            build.push_str(", ")
+            build.append(codec_of(qt.copy(), mods.copy()))
+            build.push_str(", ")
+            build.append(codec_of(rt.copy(), mods.copy()))
+            build.push_str(", h.")
+            build.append(fname.copy())
+            build.push_str(")\n")
+            // the client method
+            client.push_str("    fn ")
+            client.append(fname.copy())
+            if !r.client_stream {
+                client.push_str("(self, req: ")
+                client.append(qn.copy())
+                client.push_str(", o: grpc.CallOpts) -> ")
+            } else {
+                client.push_str("(self, o: grpc.CallOpts) -> ")
+            }
+            if !r.client_stream && !r.server_stream {
+                client.push_str("Result[")
+                client.append(rn.copy())
+                client.push_str(", def.Status] uses io, clock {{\n        let reg = self.reg\n        grpc.unary(self.ch, ")
+                client.append(q(path.copy()))
+                client.push_str(", ")
+                client.append(codec_of(qt.copy(), mods.copy()))
+                client.push_str(", ")
+                client.append(codec_of(rt.copy(), mods.copy()))
+                client.push_str(", req, o)\n    }}\n\n")
+            } else {
+                client.push_str("Result[grpc.Call[")
+                client.append(qn.copy())
+                client.push_str(", ")
+                client.append(rn.copy())
+                client.push_str("], def.Status] uses io, clock {{\n        let reg = self.reg\n        grpc.")
+                client.append(if !r.client_stream && r.server_stream { String.from("server_stream") } else if r.client_stream && !r.server_stream { String.from("client_stream") } else { String.from("bidi") })
+                client.push_str("(self.ch, ")
+                client.append(q(path.copy()))
+                client.push_str(", ")
+                client.append(codec_of(qt.copy(), mods.copy()))
+                client.push_str(", ")
+                client.append(codec_of(rt.copy(), mods.copy()))
+                if !r.client_stream { client.push_str(", req") }
+                client.push_str(", o)\n    }}\n\n")
+            }
+        }
+        let tname = pgen.pascal_case(sv.name.copy())
+        body.push_str("/// The functions that implement ")
+        body.append(sv.name.copy())
+        body.push_str(" (`")
+        body.append(full.copy())
+        body.push_str("`).\npub type ")
+        body.append(tname.copy())
+        body.push_str("Handlers = {{\n")
+        body.append(handlers)
+        body.push_str("}}\n\n/// ")
+        body.append(sv.name.copy())
+        body.push_str(" as a service for `grpc.handler`, `grpc.middleware`, `connect.handler`, `def.mount_jsonrpc`.\npub fn ")
+        body.append(lower.copy())
+        body.push_str("_service(reg: proto.Registry, h: ")
+        body.append(tname.copy())
+        body.push_str("Handlers) -> def.Service uses clock {{\n    def.service(")
+        body.append(q(full.copy()))
+        body.push_str(")\n")
+        body.append(build)
+        body.push_str("}}\n\n/// A client of ")
+        body.append(sv.name.copy())
+        body.push_str(" over a channel.\npub type ")
+        body.append(tname.copy())
+        body.push_str("Client = {{ ch: grpc.Channel, reg: proto.Registry }}\n\npub fn ")
+        body.append(lower.copy())
+        body.push_str("_client(ch: grpc.Channel, reg: proto.Registry) -> ")
+        body.append(tname.copy())
+        body.push_str("Client {{ ")
+        body.append(tname.copy())
+        body.push_str("Client(ch, reg) }}\n\nimpl ")
+        body.append(tname.copy())
+        body.push_str("Client {{\n")
+        body.append(client)
+        body.push_str("}}\n\n")
+    }
+    let mut text = String.from("//! Generated by eider-rpc from ")
+    text.append(f.path.copy())
+    text.push_str(". Do not edit.\n\nimport std.serial\nimport proto\nimport rpc.def\nimport rpc.grpc\n")
+    for mi in 0..mods.len() {
+        let m = mods[mi].copy()
+        text.push_str("import ")
+        if opt.prefix.len() > 0 {
+            text.append(opt.prefix.copy())
+            text.push_str(".")
+        }
+        text.append(m.copy())
+        text.push_str(" as ")
+        text.append(alias_of(mods.copy(), m.copy()))
+        text.push_str("\n")
+    }
+    text.push_str("\n")
+    text.append(body)
+    Ok(Out(name.copy(), cat(name, ".ei"), text))
+}
+
+/// A `_grpc` module for each file of `files` that has services.
+pub fn generate(files: List[parser.File], opt: pgen.Options) -> Result[List[Out], String] {
+    let rs = pgen.resolver(files.copy(), opt.copy_options())
+    let mut out: List[Out] = List.new()
+    for f in files {
+        if f.services.len() > 0 { out.push(gen_file(f.copy(), rs.clone_resolver(), opt.copy_options())?) }
+    }
+    Ok(out)
+}
