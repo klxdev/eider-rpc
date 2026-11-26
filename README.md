@@ -32,7 +32,7 @@ r.post("/rpc", jsonrpc.handler(t))      // r: an http/router Router
 [deps.rpc]
 git = "https://github.com/klxdev/eider-rpc.git"
 version = "0.1.0"
-uses = ["net", "io", "clock"]                 # for the client calls (rpc/client, rpc/remote)
+uses = ["net", "io", "clock"]                 # for the client calls (rpc/client, rpc/remote); add "threads" for rpc/grpc (docs/grpc.md)
 
 [deps.http]
 git = "https://github.com/klxdev/eider-http.git"

@@ -6,9 +6,10 @@ main = "main.ei"
 description = "An example JSON-RPC 2.0 service on eider-rpc and eider-http: a key-value store and a calculator (../../docs/jsonrpc.md)"
 
 # JSON-RPC: this repository's package (an example isn't published, so a path is fine)
+# `threads` is for rpc/grpc (its keepalive and its servers start tasks); a program that only imports rpc/jsonrpc loads none of that
 [deps.rpc]
 path = "../.."
-uses = ["net", "io", "clock"]
+uses = ["net", "io", "clock", "threads"]
 
 # the server and client: sockets, deadlines, worker threads; files for the profiler's
 # /debug/profile (http/profiling)

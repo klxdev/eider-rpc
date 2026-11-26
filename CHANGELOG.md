@@ -14,7 +14,7 @@ gRPC and Connect alongside JSON-RPC (eider-rpc#3). Docs: docs/grpc.md. Needs eid
 - **`rpc/reflection`**: gRPC server reflection (`v1` and `v1alpha`), from the descriptors the generated modules carry (`add_descs`): grpcurl lists, describes and calls a service with no `.proto` files.
 - **`rpc/gen`** and `examples/protoc_grpc`: handler records, `<service>_service` and typed clients generated from `.proto` services.
 - Tested without another language (`tests/grpc_test`, `grpc_wire_test`, `grpc_upgrade_test`, `stubs_test`, `control_test`, which serves BuildKit's real Control service) and against grpcurl, grpc-go (client and server) and curl (`tests/grpc_interop.sh`).
-- New dependency: `[deps.proto]` (eider-proto, pure).
+- **Capabilities:** a package that imports `rpc/grpc` (or `rpc/connect`'s streaming) also grants `rpc` `threads`; one that imports only `rpc/jsonrpc` does not (its examples/kvstore grants it anyway because the package's grants are per package, so `eider-pkg fetch` asks for it). New dependencies: `[deps.proto]` (eider-proto, pure) and `[deps.compression]` (`io`, `clock`, as eider-http grants it).
 
 ## 0.7.1
 
