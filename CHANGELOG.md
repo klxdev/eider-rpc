@@ -3,9 +3,9 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.2
 
-gRPC and Connect alongside JSON-RPC (eider-rpc#3). Docs: docs/grpc.md. Needs eider-http with HTTP/2 (`http/h2`) and eider-proto.
+gRPC and Connect alongside JSON-RPC (eider-rpc#3). Docs: docs/grpc.md. **Needs Eider 0.7.10 or later** (`scripts/env.sh` refuses an older toolchain), eider-http 0.7.7 (HTTP/2) and eider-proto 0.7.0.
 
 - **`rpc/def`**: a service defined once (`service`, `unary`, `server_stream`, `client_stream`, `bidi`) with a `Codec` per message type (protobuf and JSON), `Ctx`, `Status` and the gRPC status codes; `mount_jsonrpc` serves its unary methods on a JSON-RPC table.
 - **`rpc/grpc`**: gRPC over `http/h2`, server (`handler`, `middleware` for `server.Config.h2_wrap`) and client (`channel`, `unary`, `server_stream`, `client_stream`, `bidi`): framing, trailers and trailers-only errors, metadata (`-bin`), `grpc-timeout` and deadlines, cancellation, any connected duplex (also the `Client` of `h2.accept_client`). Compression off.
