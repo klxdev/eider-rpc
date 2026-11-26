@@ -3,6 +3,10 @@
 eider-rpc's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.7.3
+
+Needs eider-http 0.7.8. No change to rpc itself: eider-http 0.7.8 fixes a client race in which a gRPC call to a grpc-go server could fail with "the peer reset the stream (NO_ERROR)" (the server resets the stream after its trailers; about 1 call in 100).
+
 ## 0.7.2
 
 gRPC and Connect alongside JSON-RPC (eider-rpc#3). Docs: docs/grpc.md. **Needs Eider 0.7.10 or later** (`scripts/env.sh` refuses an older toolchain), eider-http 0.7.7 (HTTP/2) and eider-proto 0.7.0.
