@@ -83,6 +83,13 @@ if command -v curl >/dev/null 2>&1; then
   printf '\012\005world' > "$T/req.bin"
   curl -sS --max-time 20 -H 'Content-Type: application/proto' --data-binary @"$T/req.bin" "http://127.0.0.1:$port/demo.Greeter/SayHello" | od -An -c | tr -d ' \n' > "$T/o" 2>&1
   check "Connect (curl, protobuf body)" "$T/o" "Hello,world"
+  printf '\000\000\000\000\007{"n":3}' > "$T/sreq.bin"
+  curl -sS --max-time 20 -H 'Content-Type: application/connect+json' --data-binary @"$T/sreq.bin" "http://127.0.0.1:$port/demo.Greeter/Count" > "$T/o" 2>&1
+  check "Connect server streaming over HTTP/1.1 (envelopes, end-stream)" "$T/o" '"n":1' '"n":2' '"n":3'
+  if curl -V | grep -q nghttp2; then
+    curl -sS --max-time 20 --http2-prior-knowledge -H 'Content-Type: application/connect+json' --data-binary @"$T/sreq.bin" "http://127.0.0.1:$port/demo.Greeter/Count" > "$T/o" 2>&1
+    check "Connect server streaming over HTTP/2" "$T/o" '"n":1' '"n":3'
+  fi
 else
   echo "skip grpc interop: curl is not installed (Connect)"
 fi

@@ -1,0 +1,141 @@
+// Connect streaming over HTTP/2 (connect.middleware), by hand: raw http/h2 requests with the envelopes written out, against a server
+// running the Greeter service: server-streaming, client-streaming, bidirectional (each message answered before the next is sent),
+// an error in the end-stream envelope, and the stream that is not Connect going on to the next handler.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.h2
+import http.transport
+import rpc.def
+import rpc.connect
+import rpc.tests.demo.greeter as greeter
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn hd(n: str, v: str) -> http.Header { http.Header(n.bytes(), v.bytes()) }
+
+fn head(path: str, ct: str) -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(hd(":method", "POST"))
+    r.push(hd(":scheme", "http"))
+    r.push(hd(":path", path))
+    r.push(hd(":authority", "t"))
+    r.push(hd("content-type", ct))
+    r
+}
+
+fn env(json: str) -> List[u8] { connect.envelope(0, json.bytes()) }
+
+/// The envelopes of a body, as text: `[flags] payload`.
+fn show_envs(b: List[u8]) -> String {
+    let mut out = String.from("")
+    let mut i: usize = 0
+    while i + 5 <= b.len() {
+        let n = ((b[i + 1] as usize) << 24) | ((b[i + 2] as usize) << 16) | ((b[i + 3] as usize) << 8) | (b[i + 4] as usize)
+        out.push_str("[")
+        out.append(b[i].to_string())
+        out.push_str("] ")
+        out.append(sys.to_string(b.slice(i + 5, i + 5 + n)))
+        out.push_str(" ")
+        i += 5 + n
+    }
+    out
+}
+
+fn read_all(s: h2.Stream) -> List[u8] uses io, clock {
+    let mut out: List[u8] = List.new()
+    while true {
+        match s.read(65536, time.after(time.seconds(10))) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                out.extend(b)
+            }
+            Err(e) => { break }
+        }
+    }
+    out
+}
+
+fn main() uses net, io, clock, threads {
+    let svcs = List[greeter.service()]
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let next = |s: h2.Stream| -> () {
+        let mut r: List[http.Header] = List.new()
+        r.push(hd(":status", "404"))
+        let z = s.send_headers(r, true)
+    }
+    let srv = spawn(|| -> i32 {
+        let layer = connect.middleware(svcs)
+        let z = h2.serve(sw, h2.options(), layer(next))
+        0
+    })
+    let c = h2.connect(h2.wire_of_transport(transport.plain(p.r)), h2.options()).unwrap()
+    let dl = time.after(time.seconds(10))
+
+    say(String.from("-- server streaming (JSON): one request envelope, a stream of envelopes, then the end-stream envelope"))
+    let s1 = c.open(head("/demo.Greeter/Count", "application/connect+json"), false, dl).unwrap()
+    let z3 = s1.send(env("{{\"n\":3}}"), true, dl)
+    say(show_envs(read_all(s1)))
+    s1.release()
+
+    say(String.from("-- client streaming (JSON)"))
+    let s2 = c.open(head("/demo.Greeter/Sum", "application/connect+json"), false, dl).unwrap()
+    let mut body = env("{{\"n\":1}}")
+    body.extend(env("{{\"n\":2}}"))
+    body.extend(env("{{\"n\":39}}"))
+    let z4 = s2.send(body, true, dl)
+    say(show_envs(read_all(s2)))
+    s2.release()
+
+    say(String.from("-- bidirectional (JSON): each message is answered before the next is sent"))
+    let s3 = c.open(head("/demo.Greeter/Chat", "application/connect+json"), false, dl).unwrap()
+    for w in List["one", "two"] {
+        let mut m = String.from("{{\"name\":\"")
+        m.push_str(w)
+        m.push_str("\"}}")
+        let z5 = s3.send(connect.envelope(0, m.bytes()), false, dl)
+        let got = s3.read(65536, dl).unwrap()
+        say(show_envs(got))
+    }
+    let z6 = s3.finish()
+    say(show_envs(read_all(s3)))
+    s3.release()
+
+    say(String.from("-- protobuf envelopes (HelloRequest with name world is 0a05 world)"))
+    let s4 = c.open(head("/demo.Greeter/Chat", "application/connect+proto"), false, dl).unwrap()
+    let z7 = s4.send(connect.envelope(0, List[10 as u8, 5, 119, 111, 114, 108, 100]), true, dl)
+    let r4 = read_all(s4)
+    say(show_envs(r4))
+    s4.release()
+
+    say(String.from("-- an error ends the stream with the error in the end-stream envelope; the HTTP status is still 200"))
+    let s5 = c.open(head("/demo.Greeter/Fail", "application/connect+json"), false, dl).unwrap()
+    let z8 = s5.send(env("{{\"name\":\"zed\"}}"), true, dl)
+    let h5 = s5.headers(dl).unwrap()
+    say(sys.to_string(http.find_s(h5, ":status").unwrap()))
+    say(show_envs(read_all(s5)))
+    s5.release()
+
+    say(String.from("-- an unknown method"))
+    let s6 = c.open(head("/demo.Greeter/Nope", "application/connect+json"), false, dl).unwrap()
+    let z9 = s6.send(env("{{}}"), true, dl)
+    say(show_envs(read_all(s6)))
+    s6.release()
+
+    say(String.from("-- a stream that is not Connect goes to the next handler"))
+    let s7 = c.open(head("/demo.Greeter/Count", "application/grpc"), true, dl).unwrap()
+    say(sys.to_string(http.find_s(s7.headers(dl).unwrap(), ":status").unwrap()))
+    s7.release()
+    c.close()
+    let z10 = srv.join()
+    say(String.from("done"))
+}

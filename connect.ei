@@ -7,13 +7,22 @@
 //! code and a JSON body `{"code": "not_found", "message": "..."}` (the Connect error format; the codes are the gRPC
 //! ones in lowercase). `connect-timeout-ms` is the call's deadline. The request headers (except the transport's own)
 //! are the call's metadata and `Ctx.set_header` adds response headers. Streaming methods are not served here (they
-//! are `unimplemented`: use gRPC); the Connect streaming envelope is not implemented.
+//! are served as below, not by this unary path).
+//!
+//! Streaming (`application/connect+json` and `application/connect+proto`): messages travel in envelopes (a flags byte, a 4-byte
+//! big-endian length, the message) and the stream ends with an end-stream envelope (flag 2) holding a JSON object with the error, if any,
+//! and the trailing metadata. `connect.middleware(services)` (for `server.Config.h2_wrap`) serves all four kinds over HTTP/2, bidirectional
+//! included; `connect.handler` also serves server-streaming methods over HTTP/1.1 (one request envelope in, a chunked stream of envelopes out).
+//! Envelope compression is not supported (`connect-content-encoding` other than identity is `unimplemented`).
 
 import core.sys
 import std.bytes
+import std.sync
+import std.task
 import std.time
 import json
 import http
+import http.h2
 import rpc.def
 
 fn lower_code(code: i32) -> List[u8] {
@@ -80,6 +89,7 @@ pub fn handler(services: List[def.Service]) -> http.Handler uses clock {
             None => {}
         }
         let ct = q.header("content-type").unwrap_or(List.new())
+        if is_connect_stream(ct) { return h1_server_stream(services, q, ct) }
         let json_body = is_type(ct, "application/json")
         let proto_body = is_type(ct, "application/proto")
         if !json_body && !proto_body {
@@ -131,4 +141,294 @@ pub fn handler(services: List[def.Service]) -> http.Handler uses clock {
             Err(st) => error_response(st)
         }
     }
+}
+
+
+// ---- streaming ----
+
+/// One envelope: flags (1 compressed, 2 end of stream), the length, the payload.
+pub fn envelope(flags: u8, payload: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    out.push(flags)
+    let n = payload.len()
+    out.push(((n >> 24) & 255) as u8)
+    out.push(((n >> 16) & 255) as u8)
+    out.push(((n >> 8) & 255) as u8)
+    out.push((n & 255) as u8)
+    out.extend(payload)
+    out
+}
+
+/// The end-stream message: `{"error": {"code", "message"}, "metadata": {"key": ["value"]}}`, each only when there is something to say.
+pub fn end_stream(st: def.Status, trailers: List[http.Header]) -> List[u8] {
+    let mut body: List[u8] = List.new()
+    body.push(123)
+    let mut first = true
+    if st.code != def.OK {
+        body.extend("\"error\":{{\"code\":".bytes())
+        body.extend(json.quote(lower_code(st.code)))
+        if st.message.len() > 0 {
+            body.extend(",\"message\":".bytes())
+            body.extend(json.quote(st.message.bytes()))
+        }
+        body.push(125)
+        first = false
+    }
+    if trailers.len() > 0 {
+        if !first { body.push(44) }
+        body.extend("\"metadata\":{{".bytes())
+        let mut i: usize = 0
+        for t in trailers {
+            if i > 0 { body.push(44) }
+            body.extend(json.quote(http.lower(t.name)))
+            body.extend(":[".bytes())
+            body.extend(json.quote(t.value.copy()))
+            body.push(93)
+            i += 1
+        }
+        body.push(125)
+    }
+    body.push(125)
+    envelope(2, body)
+}
+
+fn is_connect_stream(ct: List[u8]) -> bool {
+    let m = http.media_type(ct)
+    http.eq_s(m, "application/connect+json") || http.eq_s(m, "application/connect+proto")
+}
+
+type EReader = { st: h2.Stream, buf: List[u8], ended: bool }
+
+fn next_env(inout r: EReader, dl: time.Deadline) -> Result[Option[List[u8]], def.Status] uses io, clock {
+    while true {
+        if r.buf.len() >= 5 {
+            let flags = r.buf[0]
+            let n = ((r.buf[1] as usize) << 24) | ((r.buf[2] as usize) << 16) | ((r.buf[3] as usize) << 8) | (r.buf[4] as usize)
+            if n > 4194304 { return Err(def.status(def.RESOURCE_EXHAUSTED, "a message is larger than the receive limit")) }
+            if r.buf.len() >= 5 + n {
+                let msg = r.buf.slice(5, 5 + n)
+                r.buf.remove_range(0, 5 + n)
+                if (flags & 1) != 0 { return Err(def.status(def.UNIMPLEMENTED, "compressed envelopes are not supported")) }
+                if (flags & 2) != 0 { return Ok(None) }
+                return Ok(Some(msg))
+            }
+        }
+        if r.ended {
+            if r.buf.len() == 0 { return Ok(None) }
+            return Err(def.status(def.INVALID_ARGUMENT, "the stream ended inside an envelope"))
+        }
+        match r.st.read(65536, dl) {
+            Ok(b) => {
+                if b.len() == 0 { r.ended = true } else { r.buf.extend(b) }
+            }
+            Err(e) => {
+                if e.kind == h2.ERR_TIMEOUT { return Err(def.status(def.DEADLINE_EXCEEDED, "the deadline passed")) }
+                if e.kind == h2.ERR_RESET { return Err(def.status(def.CANCELLED, "the call was cancelled")) }
+                return Err(def.status_text(def.UNAVAILABLE, e.why))
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn split_method(path: List[u8]) -> (List[u8], List[u8]) {
+    match bytes.rfind_byte(path, 47) {
+        Some(i) => {
+            if i > 1 { return (path.slice(1, i), path.slice(i + 1, path.len())) }
+        }
+        None => {}
+    }
+    (List.new(), List.new())
+}
+
+fn serve_h2_stream(services: List[def.Service], s: h2.Stream, head: List[http.Header]) uses io, clock {
+    let ct = http.find_s(head, "content-type").unwrap_or(List.new())
+    let json_body = http.eq_s(http.media_type(ct), "application/connect+json")
+    let (svc, m) = split_method(http.find_s(head, ":path").unwrap_or(List.new()))
+    let mut found: Option[def.Method] = None
+    for sv in services {
+        if bytes.eq(sv.name.bytes(), svc) { found = sv.find(m) }
+    }
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(":status".bytes(), "200".bytes()))
+    hs.push(http.Header("content-type".bytes(), http.media_type(ct)))
+    hs.push(http.Header("connect-accept-encoding".bytes(), "identity".bytes()))
+    let blank = def.ctx(String.from(""), List.new(), time.never(), String.from(""))
+    let method = match found {
+        Some(x) => x
+        None => {
+            let z = s.send_headers(hs, false)
+            let z2 = s.send(end_stream(def.status(def.NOT_FOUND, "unknown service or method"), List.new()), true, time.after(time.seconds(10)))
+            s.release()
+            return
+        }
+    }
+    match http.find_s(head, "connect-content-encoding") {
+        Some(e) => {
+            if !http.eq_s(e, "identity") {
+                let z = s.send_headers(hs, false)
+                let z2 = s.send(end_stream(def.status(def.UNIMPLEMENTED, "unsupported connect-content-encoding (identity only)"), List.new()), true, time.after(time.seconds(10)))
+                s.release()
+                return
+            }
+        }
+        None => {}
+    }
+    let mut dl = time.never()
+    match http.find_s(head, "connect-timeout-ms") {
+        Some(t) => {
+            match bytes.parse_u64(t) {
+                Some(ms) => { dl = time.after_ms(ms as i64) }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let mut md: List[http.Header] = List.new()
+    for h in head {
+        let n = http.lower(h.name)
+        if n.len() == 0 || n[0] == 58 || http.eq_s(n, "content-type") || http.eq_s(n, "te") || http.eq_s(n, "user-agent") { continue }
+        if n.len() > 8 && bytes.eq(n.slice(0, 8), "connect-".bytes()) { continue }
+        md.push(http.Header(n, h.value))
+    }
+    let mut name = String.from("/")
+    name.append(String.from_bytes(svc.copy()).unwrap_or(String.from("")))
+    name.push_str("/")
+    name.append(String.from_bytes(m.copy()).unwrap_or(String.from("")))
+    let ctx = def.ctx(name, md, dl, String.from(""))
+    let rd = sync.lock(EReader(s, List.new(), false))
+    let sent = sync.lock(false)
+    let rawin = def.RawIn(|| -> Result[Option[List[u8]], def.Status] {
+        rd.modify(|inout r: EReader| -> Result[Option[List[u8]], def.Status] { next_env(inout r, dl) })
+    })
+    let rawout = def.RawOut(|b: List[u8]| -> Result[(), def.Status] {
+        let first = sent.modify(|inout f: bool| -> bool {
+            let was = f
+            f = true
+            !was
+        })
+        if first {
+            let mut h2s = hs.copy()
+            for x in ctx.headers_out() { h2s.push(x) }
+            match s.send_headers(h2s, false) {
+                Ok(z) => {}
+                Err(e) => { return Err(def.status_text(def.UNAVAILABLE, e.why)) }
+            }
+        }
+        match s.send(envelope(0, b), false, dl) {
+            Ok(z) => Ok(())
+            Err(e) => Err(def.status_text(def.UNAVAILABLE, e.why))
+        }
+    })
+    let run = if json_body { method.jrun } else { method.run }
+    let result = task.catch(|| -> Result[(), def.Status] { run(ctx, rawin, rawout) })
+    let mut st = def.ok()
+    match result {
+        Ok(r) => {
+            match r {
+                Ok(z) => {}
+                Err(e) => { st = e }
+            }
+        }
+        Err(why) => { st = def.status(def.INTERNAL, "the handler failed") }
+    }
+    if st.code == def.OK && dl.expired() { st = def.status(def.DEADLINE_EXCEEDED, "the deadline passed") }
+    if !sent.get() {
+        let mut h2s = hs.copy()
+        for x in ctx.headers_out() { h2s.push(x) }
+        let z = s.send_headers(h2s, false)
+    }
+    let z2 = s.send(end_stream(st, ctx.trailers_out()), true, time.after(time.seconds(10)))
+    s.release()
+}
+
+/// A layer for `server.Config.h2_wrap`: Connect streams (`application/connect+json` / `+proto`) are served here, over HTTP/2, in all four
+/// kinds; every other stream goes on (put it after `grpc.middleware`, or around it).
+pub fn middleware(services: List[def.Service]) -> h2.Middleware uses io, clock {
+    |next: h2.StreamHandler| -> h2.StreamHandler {
+        |s: h2.Stream| -> () {
+            let head = match s.headers(time.never()) {
+                Ok(h) => h
+                Err(e) => { return }
+            }
+            if is_connect_stream(http.find_s(head, "content-type").unwrap_or(List.new())) {
+                serve_h2_stream(services, s, head)
+            } else {
+                next(s)
+            }
+        }
+    }
+}
+
+
+/// A server-streaming call over HTTP/1.1 (or any HTTP version through the buffering adapter): one request envelope in the body, the
+/// response a chunked stream of envelopes ending with the end-stream envelope.
+fn h1_server_stream(services: List[def.Service], q: http.Request, ct: List[u8]) -> http.Response uses clock {
+    let json_body = http.eq_s(http.media_type(ct), "application/connect+json")
+    let (svc, m) = split_method(q.path)
+    let mut found: Option[def.Method] = None
+    for sv in services {
+        if bytes.eq(sv.name.bytes(), svc) { found = sv.find(m) }
+    }
+    let method = match found {
+        Some(x) => x
+        None => { return error_response(def.status(def.NOT_FOUND, "unknown service or method")) }
+    }
+    if method.kind != def.SERVER_STREAM { return error_response(def.status(def.UNIMPLEMENTED, "only server-streaming methods are served over HTTP/1.1; use HTTP/2 for the others")) }
+    let b = q.body
+    if b.len() < 5 { return error_response(def.status(def.INVALID_ARGUMENT, "the request is one envelope")) }
+    let n = ((b[1] as usize) << 24) | ((b[2] as usize) << 16) | ((b[3] as usize) << 8) | (b[4] as usize)
+    if b[0] != 0 || b.len() != 5 + n { return error_response(def.status(def.INVALID_ARGUMENT, "the request is one uncompressed envelope")) }
+    let msg = b.slice(5, 5 + n)
+    let mut dl = time.never()
+    match q.header("connect-timeout-ms") {
+        Some(t) => {
+            match bytes.parse_u64(t) {
+                Some(ms) => { dl = time.after_ms(ms as i64) }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let mut md: List[http.Header] = List.new()
+    for h in q.headers {
+        let nm = http.lower(h.name)
+        if http.eq_s(nm, "content-type") || http.eq_s(nm, "content-length") || http.eq_s(nm, "host") || http.eq_s(nm, "connection") { continue }
+        if nm.len() > 8 && bytes.eq(nm.slice(0, 8), "connect-".bytes()) { continue }
+        md.push(http.Header(nm, h.value))
+    }
+    let ctx = def.ctx(String.from(""), md, dl, String.from(""))
+    let given = sync.lock(false)
+    let rawin = def.RawIn(|| -> Result[Option[List[u8]], def.Status] {
+        let was = given.modify(|inout g: bool| -> bool {
+            let w = g
+            g = true
+            w
+        })
+        if was { Ok(None) } else { Ok(Some(msg)) }
+    })
+    let run = if json_body { method.jrun } else { method.run }
+    let mut r = http.response(200)
+    r.set_header("Content-Type", http.media_type(ct))
+    r.stream = Some(http.Stream(|d: http.Duplex| -> () {
+        let rawout = def.RawOut(|x: List[u8]| -> Result[(), def.Status] {
+            match d.write(envelope(0, x)) {
+                Ok(z) => Ok(())
+                Err(e) => Err(def.status_text(def.UNAVAILABLE, e.message.copy()))
+            }
+        })
+        let res = task.catch(|| -> Result[(), def.Status] { run(ctx, rawin, rawout) })
+        let mut st = def.ok()
+        match res {
+            Ok(rr) => {
+                match rr {
+                    Ok(z) => {}
+                    Err(e) => { st = e }
+                }
+            }
+            Err(why) => { st = def.status(def.INTERNAL, "the handler failed") }
+        }
+        let z = d.write(end_stream(st, ctx.trailers_out()))
+    }, false))
+    r
 }

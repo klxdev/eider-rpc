@@ -33,7 +33,13 @@ fn main() uses io, net, clock, threads, fs {
     r.post("/demo.Greeter/:method", conn)
     let mut cfg = server.config()
     cfg.h2 = Some(h2.options())
-    cfg.h2_wrap = Some(grpc.middleware(svcs))
+    // gRPC and Connect streams are served by their layers, everything else goes on to the router
+    let g = grpc.middleware(svcs)
+    let cs = connect.middleware(svcs)
+    cfg.h2_wrap = Some(|next: h2.StreamHandler| -> h2.StreamHandler {
+        let inner = g(next)
+        cs(inner)
+    })
     if a.len() >= 3 {
         let tls = secure.server_from_files(utf8.lossy(a[1].copy()), utf8.lossy(a[2].copy())).unwrap().with_h2()
         cfg.secure = Some(tls.acceptor())

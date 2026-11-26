@@ -31,12 +31,12 @@ compressed round trip, reply bytes: 50007
 Hello, again
 -- the same service over Connect (JSON and protobuf bodies) and JSON-RPC
 connect json: 200
-{"message":"Hello, json","unknown_fields":""}
+{"message":"Hello, json"}
 connect proto: 200
 Hello, proto
 connect error: 404
 {"code":"not_found","message":"no such user: z"}
 connect streaming method: 501
-{"jsonrpc":"2.0","result":{"message":"Hello, rpc","unknown_fields":""},"id":1}
+{"jsonrpc":"2.0","result":{"message":"Hello, rpc"},"id":1}
 {"jsonrpc":"2.0","error":{"code":-32005,"message":"no such user: rpc","data":"NOT_FOUND"},"id":2}
 done

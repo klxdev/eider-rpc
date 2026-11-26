@@ -133,6 +133,33 @@ pub type Codec[T] = {
 
 fn text_of(e: serial.Error) -> String { String.from_bytes(serial.error_text(e)).unwrap_or(String.from("a message error")) }
 
+fn replace_all(b: List[u8], what: List[u8], with_: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < b.len() {
+        match bytes.find(b, what, i) {
+            Some(j) => {
+                out.extend(b.slice(i, j))
+                out.extend(with_.copy())
+                i = j + what.len()
+            }
+            None => {
+                out.extend(b.slice(i, b.len()))
+                i = b.len()
+            }
+        }
+    }
+    out
+}
+
+/// JSON without the empty `unknown_fields` members of generated messages (they are protobuf bookkeeping, not part of the JSON form; an
+/// unquoted `"unknown_fields":""` cannot occur inside a JSON string, whose quotes are escaped).
+fn strip_unknown(b: List[u8]) -> List[u8] {
+    let a = replace_all(b, ",\"unknown_fields\":\"\"".bytes(), List.new())
+    let c = replace_all(a, "\"unknown_fields\":\"\",".bytes(), List.new())
+    replace_all(c, "\"unknown_fields\":\"\"".bytes(), List.new())
+}
+
 /// The codec of generated message type T, named `msg` (`pkg.Message`) in `reg`.
 pub fn codec[T: serial.Serialize + serial.Deserialize](reg: proto.Registry, msg: str) -> Codec[T] {
     let name = String.from(msg)
@@ -153,7 +180,7 @@ pub fn codec[T: serial.Serialize + serial.Deserialize](reg: proto.Registry, msg:
         },
         |x: T| -> Result[List[u8], String] {
             match json.to_bytes(x) {
-                Ok(b) => Ok(b)
+                Ok(b) => Ok(strip_unknown(b))
                 Err(e) => Err(text_of(e))
             }
         },
@@ -225,6 +252,7 @@ pub type Method = {
     name: String,
     kind: i32,
     run: fn(Ctx, RawIn, RawOut) -> Result[(), Status],
+    jrun: fn(Ctx, RawIn, RawOut) -> Result[(), Status],
     proto: Option[fn(Ctx, List[u8]) -> Result[List[u8], Status]],
     json: Option[fn(Ctx, List[u8]) -> Result[List[u8], Status]],
 }
@@ -255,89 +283,84 @@ impl Service {
         let enc = rc.enc
         let jdec = qc.jdec
         let jenc = rc.jenc
-        let proto_call = |c: Ctx, b: List[u8]| -> Result[List[u8], Status] {
-            let q = match dec(b) {
-                Ok(x) => x
-                Err(e) => { return Err(status_text(INVALID_ARGUMENT, e)) }
-            }
-            let r = f(c, q)?
-            match enc(r) {
-                Ok(out) => Ok(out)
-                Err(e) => Err(status_text(INTERNAL, e))
-            }
-        }
-        let json_call = |c: Ctx, b: List[u8]| -> Result[List[u8], Status] {
-            let q = match jdec(b) {
-                Ok(x) => x
-                Err(e) => { return Err(status_text(INVALID_ARGUMENT, e)) }
-            }
-            let r = f(c, q)?
-            match jenc(r) {
-                Ok(out) => Ok(out)
-                Err(e) => Err(status_text(INTERNAL, e))
+        let mk = |d: fn(List[u8]) -> Result[Q, String], e: fn(R) -> Result[List[u8], String]| -> fn(Ctx, List[u8]) -> Result[List[u8], Status] {
+            |c: Ctx, b: List[u8]| -> Result[List[u8], Status] {
+                let q = match d(b) {
+                    Ok(x) => x
+                    Err(why) => { return Err(status_text(INVALID_ARGUMENT, why)) }
+                }
+                let r = f(c, q)?
+                match e(r) {
+                    Ok(out) => Ok(out)
+                    Err(why) => Err(status_text(INTERNAL, why))
+                }
             }
         }
-        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
-            let nx = inp.next
-            let first = nx()?
-            let body = match first {
-                Some(b) => b
-                None => { return Err(status(INVALID_ARGUMENT, "the request has no message")) }
+        let proto_call = mk(dec, enc)
+        let json_call = mk(jdec, jenc)
+        let mkrun = |call: fn(Ctx, List[u8]) -> Result[List[u8], Status]| -> fn(Ctx, RawIn, RawOut) -> Result[(), Status] {
+            |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
+                let nx = inp.next
+                let first = nx()?
+                let body = match first {
+                    Some(b) => b
+                    None => { return Err(status(INVALID_ARGUMENT, "the request has no message")) }
+                }
+                let second = nx()?
+                if second.is_some() { return Err(status(INVALID_ARGUMENT, "a unary request has one message")) }
+                let r = call(c, body)?
+                let p = out.put
+                p(r)
             }
-            let second = nx()?
-            if second.is_some() { return Err(status(INVALID_ARGUMENT, "a unary request has one message")) }
-            let r = proto_call(c, body)?
-            let p = out.put
-            p(r)
         }
-        self.with(Method(String.from(name), UNARY, run, Some(proto_call), Some(json_call)))
+        self.with(Method(String.from(name), UNARY, mkrun(proto_call), mkrun(json_call), Some(proto_call), Some(json_call)))
     }
 
     /// A server-streaming method: one request, then `out.send` as many responses as it likes.
     fn server_stream[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, Q, Out[R]) -> Result[(), Status]) -> Service {
-        let dec = qc.dec
-        let enc = rc.enc
-        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
-            let nx = inp.next
-            let first = nx()?
-            let body = match first {
-                Some(b) => b
-                None => { return Err(status(INVALID_ARGUMENT, "the request has no message")) }
+        let mkrun = |d: fn(List[u8]) -> Result[Q, String], e: fn(R) -> Result[List[u8], String]| -> fn(Ctx, RawIn, RawOut) -> Result[(), Status] {
+            |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
+                let nx = inp.next
+                let first = nx()?
+                let body = match first {
+                    Some(b) => b
+                    None => { return Err(status(INVALID_ARGUMENT, "the request has no message")) }
+                }
+                let second = nx()?
+                if second.is_some() { return Err(status(INVALID_ARGUMENT, "a server-streaming request has one message")) }
+                let q = match d(body) {
+                    Ok(x) => x
+                    Err(why) => { return Err(status_text(INVALID_ARGUMENT, why)) }
+                }
+                f(c, q, Out(out, e))
             }
-            let second = nx()?
-            if second.is_some() { return Err(status(INVALID_ARGUMENT, "a server-streaming request has one message")) }
-            let q = match dec(body) {
-                Ok(x) => x
-                Err(e) => { return Err(status_text(INVALID_ARGUMENT, e)) }
-            }
-            f(c, q, Out(out, enc))
         }
-        self.with(Method(String.from(name), SERVER_STREAM, run, None, None))
+        self.with(Method(String.from(name), SERVER_STREAM, mkrun(qc.dec, rc.enc), mkrun(qc.jdec, rc.jenc), None, None))
     }
 
     /// A client-streaming method: `inp.recv` the requests until `None`, then one response.
     fn client_stream[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, In[Q]) -> Result[R, Status]) -> Service {
-        let dec = qc.dec
-        let enc = rc.enc
-        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
-            let r = f(c, In(inp, dec))?
-            match enc(r) {
-                Ok(b) => {
-                    let p = out.put
-                    p(b)
+        let mkrun = |d: fn(List[u8]) -> Result[Q, String], e: fn(R) -> Result[List[u8], String]| -> fn(Ctx, RawIn, RawOut) -> Result[(), Status] {
+            |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] {
+                let r = f(c, In(inp, d))?
+                match e(r) {
+                    Ok(b) => {
+                        let p = out.put
+                        p(b)
+                    }
+                    Err(why) => Err(status_text(INTERNAL, why))
                 }
-                Err(e) => Err(status_text(INTERNAL, e))
             }
         }
-        self.with(Method(String.from(name), CLIENT_STREAM, run, None, None))
+        self.with(Method(String.from(name), CLIENT_STREAM, mkrun(qc.dec, rc.enc), mkrun(qc.jdec, rc.jenc), None, None))
     }
 
     /// A bidirectional method: requests in, responses out, in any interleaving.
     fn bidi[Q, R](self, name: str, qc: Codec[Q], rc: Codec[R], f: fn(Ctx, In[Q], Out[R]) -> Result[(), Status]) -> Service {
-        let dec = qc.dec
-        let enc = rc.enc
-        let run = |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] { f(c, In(inp, dec), Out(out, enc)) }
-        self.with(Method(String.from(name), BIDI, run, None, None))
+        let mkrun = |d: fn(List[u8]) -> Result[Q, String], e: fn(R) -> Result[List[u8], String]| -> fn(Ctx, RawIn, RawOut) -> Result[(), Status] {
+            |c: Ctx, inp: RawIn, out: RawOut| -> Result[(), Status] { f(c, In(inp, d), Out(out, e)) }
+        }
+        self.with(Method(String.from(name), BIDI, mkrun(qc.dec, rc.enc), mkrun(qc.jdec, rc.jenc), None, None))
     }
 }
 

@@ -1,0 +1,19 @@
+-- server streaming (JSON): one request envelope, a stream of envelopes, then the end-stream envelope
+[0] {"n":1} [0] {"n":2} [0] {"n":3} [2] {} 
+-- client streaming (JSON)
+[0] {"n":42} [2] {} 
+-- bidirectional (JSON): each message is answered before the next is sent
+[0] {"message":"echo: one"} 
+[0] {"message":"echo: two"} 
+[2] {} 
+-- protobuf envelopes (HelloRequest with name world is 0a05 world)
+[0] 
+echo: world [2] {} 
+-- an error ends the stream with the error in the end-stream envelope; the HTTP status is still 200
+200
+[2] {"error":{"code":"not_found","message":"no such user: zed"},"metadata":{"x-failed":["yes"]}} 
+-- an unknown method
+[2] {"error":{"code":"not_found","message":"unknown service or method"}} 
+-- a stream that is not Connect goes to the next handler
+404
+done
