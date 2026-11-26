@@ -1,0 +1,37 @@
+// Hand-written message types with serial decorators: the same field names in JSON (Connect, JSON-RPC) and in the protobuf schema lookup.
+// Protobuf field NUMBERS are not decorators: they live in the schema (a .proto, or `proto.message(...).field(1, "userId", ...)`).
+
+import std.io
+import std.encoding
+import std.serial
+import proto
+import rpc.def
+
+@[derive(Serialize, Deserialize), serial(rename_all = "camelCase")]
+type Profile = {
+    user_id: i64,
+    @[serial(name = "displayName")] shown_as: String,
+    email_address: String,
+    @[serial(default)] score: i32,
+}
+
+fn main() uses io {
+    let mut reg = proto.registry()
+    reg.add(proto.message("demo.Profile")
+        .field(1, "userId", proto.INT64)
+        .field(2, "displayName", proto.STRING)
+        .field(3, "emailAddress", proto.STRING)
+        .field(4, "score", proto.INT32))
+    let c = def.codec[Profile](reg, "demo.Profile")
+    let p = Profile(42, String.from("Ada"), String.from("ada@example.com"), 7)
+    let enc = c.enc
+    let jenc = c.jenc
+    io.errln(jenc(p).unwrap())
+    io.errln(encoding.hex(enc(p).unwrap()).bytes())
+    let dec = c.dec
+    let jdec = c.jdec
+    let back = dec(enc(p).unwrap()).unwrap()
+    io.errln(back.shown_as.bytes())
+    let fromjson = jdec("{{\"userId\":1,\"displayName\":\"Bob\",\"emailAddress\":\"b@x\"}}".bytes()).unwrap()
+    io.errln(fromjson.shown_as.bytes())
+}
