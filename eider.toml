@@ -22,7 +22,7 @@ version = "0.8.0"
 # protobuf messages for gRPC and Connect (rpc/def, rpc/grpc, rpc/connect); pure, granted nothing
 [deps.proto]
 git = "https://github.com/klxdev/eider-proto.git"
-version = "0.7.0"
+version = "0.8.0"
 
 # gzip for compressed gRPC messages (rpc/grpc); granted what eider-http grants it (eider-pkg grants per package)
 [deps.compression]
