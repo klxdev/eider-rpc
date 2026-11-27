@@ -62,7 +62,6 @@ theirs=
 [ -f "$toolchain/VERSION" ] && theirs=$(tr -d ' \n' < "$toolchain/VERSION")
 [ -n "$theirs" ] || die "the toolchain at $toolchain has no VERSION (it is older than Eider 0.1.0); eider-$pkg_name $mine needs Eider $series.x"
 [ "${theirs%.*}" = "$series" ] || die "eider-$pkg_name $mine needs an Eider $series.x toolchain, but $toolchain ($chosen) is Eider $theirs; \`eider toolchain install $series\`, or use the eider-$pkg_name release made for Eider ${theirs%.*} (CHANGELOG.md)"
-[ "${theirs##*.}" -ge 10 ] 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs: eider-$pkg_name $mine needs Eider 0.7.10 or later (eider-http's HTTP/2 needs it: the compiler of 0.7.9 and earlier crashed on a break after a closure that holds a closure, #248)"
 EIDER_TOOLCHAIN=$toolchain
 EIDER_ROOT=$toolchain
 export EIDER_TOOLCHAIN EIDER_ROOT
